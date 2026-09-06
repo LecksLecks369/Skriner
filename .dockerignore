@@ -1,0 +1,15 @@
+node_modules
+.next
+.git
+upload
+scripts
+skills
+download
+tool-results
+examples
+tests
+mini-services
+*.log
+worklog.md
+Caddyfile
+tsconfig.tsbuildinfo
