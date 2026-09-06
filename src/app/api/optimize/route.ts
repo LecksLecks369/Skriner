@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { loadSnapshotLines } from '@/lib/screener/store';
+import { numParam } from '@/lib/screener/params';
 
 export const dynamic = 'force-dynamic';
 
@@ -33,11 +34,12 @@ interface ComboResult {
 }
 
 interface CacheGlobal {
-  __optimizeCache: { ts: number; hours: number; result: unknown } | null;
+  /* кэшируем только дорогую часть — прогон сетки по снапшотам (зависит лишь от hours).
+     Ранжирование и выбор «текущей» комбинации зависят от параметров запроса и считаются каждый раз. */
+  __optimizeCache: { ts: number; hours: number; samples: number; from: number; results: ComboResult[] } | null;
 }
 const g = globalThis as unknown as CacheGlobal;
 if (!g.__optimizeCache) g.__optimizeCache = null;
-const mem = g.__optimizeCache;
 
 function runCombo(
   lines: ReturnType<typeof loadSnapshotLines>,
@@ -132,34 +134,44 @@ function runCombo(
 
 export async function GET(req: NextRequest) {
   const sp = req.nextUrl.searchParams;
-  const hours = Math.min(48, Math.max(2, parseFloat(sp.get('hours') || '24') || 24));
-  const minDecided = Math.max(3, parseFloat(sp.get('minDecided') || '8') || 8);
-  const curThreshold = Math.max(0.05, parseFloat(sp.get('threshold') || '0.25') || 0.25);
-  const curScore = Math.max(0, parseFloat(sp.get('minScore') || '0') || 0);
-  const curCooldown = Math.max(1, parseFloat(sp.get('cooldownMin') || '10') || 10);
+  const hours = numParam(sp, 'hours', 24, 2, 48);
+  const minDecided = numParam(sp, 'minDecided', 8, 3);
+  const curThreshold = numParam(sp, 'threshold', 0.25, 0.05);
+  const curScore = numParam(sp, 'minScore', 0, 0);
+  const curCooldown = numParam(sp, 'cooldownMin', 10, 1);
 
-  if (mem && mem.hours === hours && Date.now() - mem.ts < 5 * 60_000) {
-    return NextResponse.json(mem.result as Record<string, unknown>);
-  }
+  // читаем кэш на каждом запросе: значение globalThis меняется, ссылка времени импорта — нет
+  const cached = g.__optimizeCache;
+  let results: ComboResult[];
+  let samples: number;
+  let from: number;
 
-  const lines = loadSnapshotLines(hours);
-  if (lines.length < 30) {
-    return NextResponse.json({
-      hours,
-      samples: lines.length,
-      message: 'мало истории снапшотов: нужно ≥30 циклов скана (~25 минут работы), статистика набирается',
-      best: [],
-      current: null,
-    });
-  }
-
-  const results: ComboResult[] = [];
-  for (const th of THRESHOLDS) {
-    for (const sc of SCORES) {
-      for (const cd of COOLDOWNS) {
-        results.push(runCombo(lines, th, sc, cd, hours));
+  if (cached && cached.hours === hours && Date.now() - cached.ts < 5 * 60_000) {
+    results = cached.results;
+    samples = cached.samples;
+    from = cached.from;
+  } else {
+    const lines = loadSnapshotLines(hours);
+    if (lines.length < 30) {
+      return NextResponse.json({
+        hours,
+        samples: lines.length,
+        message: 'мало истории снапшотов: нужно ≥30 циклов скана (~25 минут работы), статистика набирается',
+        best: [],
+        current: null,
+      });
+    }
+    results = [];
+    for (const th of THRESHOLDS) {
+      for (const sc of SCORES) {
+        for (const cd of COOLDOWNS) {
+          results.push(runCombo(lines, th, sc, cd, hours));
+        }
       }
     }
+    samples = lines.length;
+    from = lines[0].ts;
+    g.__optimizeCache = { ts: Date.now(), hours, samples, from, results };
   }
 
   // ранжирование: матожидание × значимость (√числа сделок)
@@ -174,13 +186,12 @@ export async function GET(req: NextRequest) {
 
   const resp = {
     hours,
-    samples: lines.length,
-    from: lines[0].ts,
+    samples,
+    from,
     grid: { thresholds: THRESHOLDS, scores: SCORES, cooldowns: COOLDOWNS },
     best,
     current,
   };
-  g.__optimizeCache = { ts: Date.now(), hours, result: resp };
   return NextResponse.json(resp);
 }
 

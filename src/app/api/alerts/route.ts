@@ -1,6 +1,7 @@
 import { NextRequest } from 'next/server';
 import { getScan } from '@/lib/screener/scan';
 import type { CoinRow } from '@/lib/screener/types';
+import { numParam } from '@/lib/screener/params';
 
 export const dynamic = 'force-dynamic';
 
@@ -14,8 +15,8 @@ interface StreamInit {
 export async function GET(req: NextRequest) {
   const sp = req.nextUrl.searchParams;
   const init: StreamInit = {
-    thresholdPct: Math.max(0.05, parseFloat(sp.get('threshold') || '0.3') || 0.3),
-    minScore: Math.max(0, parseFloat(sp.get('minScore') || '0') || 0),
+    thresholdPct: numParam(sp, 'threshold', 0.3, 0.05),
+    minScore: numParam(sp, 'minScore', 0, 0),
     refExchange: sp.get('ref') || 'auto',
   };
 

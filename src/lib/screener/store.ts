@@ -120,13 +120,18 @@ export const seriesStore = {
     if (std < 1e-6) return cur > mean + 0.05 ? 3.5 : null; // стабильный спред + внезапный скачок
     return Math.max(-5, Math.min(8, (cur - mean) / std));
   },
-  markSignal(symbol: string, ts: number, thresholdPct: number, spreadPct: number) {
-    if (spreadPct >= thresholdPct) {
+  /** Возраст сигнала: ставим метку, пока спред выше порога, и снимаем, когда он опустился ниже.
+      Вызывать на каждом скане для каждой монеты, иначе метка никогда не сбрасывается. */
+  trackSignalAge(symbol: string, ts: number, thresholdPct: number, spreadPct: number | null) {
+    if (spreadPct != null && spreadPct >= thresholdPct) {
       if (!store.series.firstSignal[symbol]) store.series.firstSignal[symbol] = ts;
-      store.series.lastSignalTs[symbol] = ts;
     } else {
       delete store.series.firstSignal[symbol];
     }
+  },
+  /** Отметка о записи в журнал — только для cooldown, не для возраста сигнала */
+  markJournaled(symbol: string, ts: number) {
+    store.series.lastSignalTs[symbol] = ts;
   },
   getLastSignalTs(symbol: string): number {
     return store.series.lastSignalTs[symbol] || 0;

@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import type { CoinRow, NetworkInfo, PaperTrade } from '@/lib/screener/types';
+import { netSpreadForPair } from '@/lib/screener/pair';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -192,7 +193,14 @@ function PaperSection({ row }: { row: CoinRow }) {
       await fetch('/api/paper', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'close', id: t.id, netExit: row.netSpreadPct ?? 0, reason: 'manual' }),
+        // спред считаем по паре бирж самой сделки, а не по текущим лучшим bid/ask монеты;
+        // если цен нет — закрываем в ноль по netEntry, иначе netExit=0 дал бы «полный выигрыш»
+        body: JSON.stringify({
+          action: 'close',
+          id: t.id,
+          netExit: netSpreadForPair(row, t.buyEx, t.sellEx) ?? t.netEntry,
+          reason: 'manual',
+        }),
       });
       load();
     } finally {
@@ -250,17 +258,20 @@ export function CoinModal({
   const [hist, setHist] = useState<SpreadPoint[]>([]);
   const [nets, setNets] = useState<{ networks: NetworkInfo[]; note?: string } | null>(null);
 
+  const symbol = row?.symbol;
+  // зависим от символа, а не от identity строки: строка обновляется каждым сканом,
+  // и на [row] эти запросы уходили бы заново каждые 30 секунд
   useEffect(() => {
-    if (!row) return;
-    void fetch(`/api/spread-history?symbol=${row.symbol}`, { cache: 'no-store' })
+    if (!symbol) return;
+    void fetch(`/api/spread-history?symbol=${symbol}`, { cache: 'no-store' })
       .then((r) => r.json())
       .then((j) => setHist(j.points || []))
       .catch(() => undefined);
-    void fetch(`/api/networks?symbol=${row.symbol}`, { cache: 'no-store' })
+    void fetch(`/api/networks?symbol=${symbol}`, { cache: 'no-store' })
       .then((r) => r.json())
       .then((j) => setNets(j))
       .catch(() => undefined);
-  }, [row]);
+  }, [symbol]);
 
   if (!row) return null;
 

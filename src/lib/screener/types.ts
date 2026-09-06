@@ -218,7 +218,7 @@ export interface ScanResponse {
   rows: CoinRow[];
   statuses: ExchangeStatus[];
   errors: Record<string, string>;
-  refExchange: ExchangeId;
+  refExchange: ExchangeId | 'auto';
   alertThresholdPct: number;
   journal: JournalSummary;
   market: MarketPulse | null;

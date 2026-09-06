@@ -134,9 +134,13 @@ export async function POST(req: NextRequest) {
     if (body.action === 'close' && body.id) {
       const tr = trades.find((x) => x.id === body.id && x.status === 'open');
       if (!tr) return NextResponse.json({ error: 'сделка не найдена' }, { status: 404 });
+      // netExit обязателен и должен быть числом: молчаливый 0 записал бы фиктивный «полный выигрыш»
+      if (typeof body.netExit !== 'number' || !Number.isFinite(body.netExit)) {
+        return NextResponse.json({ error: 'netExit обязателен и должен быть числом' }, { status: 400 });
+      }
       tr.status = 'closed';
       tr.closedTs = Date.now();
-      tr.netExit = body.netExit ?? 0;
+      tr.netExit = body.netExit;
       tr.pnlPct = Number((tr.netEntry - tr.netExit).toFixed(4));
       tr.closeReason = body.reason || 'manual';
       save();

@@ -23,29 +23,29 @@ function depthWithin(levels: { p: number; s: number }[], mid: number, bandPct: n
 /** Проскальзывание рыночного ордера на $budget по уровней книги; null если стакана не хватило */
 export function slipForUsd(levels: { p: number; s: number }[], mid: number, budgetUsd: number): number | null {
   let filled = 0;
-  let cost = 0;
+  let qty = 0;
   for (const l of levels) {
     const lvlUsd = l.p * l.s;
     const take = Math.min(lvlUsd, budgetUsd - filled);
     filled += take;
-    cost += take * l.p;
+    qty += take / l.p;
     if (filled >= budgetUsd - 1e-9) break;
   }
   if (filled < budgetUsd * 0.999) return null; // книга мельче ордера
-  const avg = cost / filled;
+  const avg = filled / qty; // средневзвешенная цена исполнения (по факту купленного количества)
   return (Math.abs(avg - mid) / mid) * 100;
 }
 
 /** Максимальный размер ордера (USD) с слипейджем ≤ maxSlipPct по одной стороне */
 export function maxSizeForSlip(levels: { p: number; s: number }[], mid: number, maxSlipPct = MAX_SLIP_PCT): number {
   let filled = 0;
-  let cost = 0;
+  let qty = 0;
   for (const l of levels) {
     const lvlUsd = l.p * l.s;
     const prevFilled = filled;
     filled += lvlUsd;
-    cost += lvlUsd * l.p;
-    const avg = cost / filled;
+    qty += lvlUsd / l.p;
+    const avg = filled / qty;
     if ((Math.abs(avg - mid) / mid) * 100 > maxSlipPct) return Math.max(0, prevFilled);
   }
   return filled;

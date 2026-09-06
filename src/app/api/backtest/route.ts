@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { loadSnapshotLines } from '@/lib/screener/store';
+import { numParam } from '@/lib/screener/params';
 
 export const dynamic = 'force-dynamic';
 
@@ -17,10 +18,10 @@ interface BtSignal {
  */
 export async function GET(req: NextRequest) {
   const sp = req.nextUrl.searchParams;
-  const threshold = Math.max(0.05, parseFloat(sp.get('threshold') || '0.25') || 0.25);
-  const minScore = Math.max(0, parseFloat(sp.get('minScore') || '0') || 0);
-  const hours = Math.min(48, Math.max(1, parseFloat(sp.get('hours') || '24') || 24));
-  const cooldownMin = Math.max(1, parseFloat(sp.get('cooldownMin') || '10') || 10);
+  const threshold = numParam(sp, 'threshold', 0.25, 0.05);
+  const minScore = numParam(sp, 'minScore', 0, 0);
+  const hours = numParam(sp, 'hours', 24, 1, 48);
+  const cooldownMin = numParam(sp, 'cooldownMin', 10, 1);
   const windowMs = 30 * 60 * 1000;
 
   const lines = loadSnapshotLines(hours);

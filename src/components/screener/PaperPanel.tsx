@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { CoinRow, PaperTrade, ScanResponse } from '@/lib/screener/types';
 import { EX_MAP } from './format';
+import { netSpreadForPair } from '@/lib/screener/pair';
 import { Button } from '@/components/ui/button';
 import { toast } from '@/hooks/use-toast';
 
@@ -116,14 +117,17 @@ export function PaperPanel({ scan }: { scan: ScanResponse | null }) {
     const open = trades.filter((t) => t.status === 'open');
     for (const t of open) {
       const row = rowsRef.current.get(t.symbol);
-      if (!row || row.netSpreadPct == null) continue;
+      if (!row) continue;
+      // спред ног самой сделки, а не текущей лучшей пары бирж монеты
+      const cur = netSpreadForPair(row, t.buyEx, t.sellEx);
+      if (cur == null) continue;
       const tp = Math.max(0.05, t.netEntry * 0.35);
       const sl = t.netEntry + 0.25;
-      if (row.netSpreadPct <= tp) {
-        void close(t.id, row.netSpreadPct, 'tp', true);
-        toast({ title: `📝 TP: ${t.symbol.replace(/USDT$/, '')}`, description: `спред сошёлся: ${(t.netEntry - row.netSpreadPct).toFixed(2)}% прибыли`, duration: 7000 });
-      } else if (row.netSpreadPct >= sl) {
-        void close(t.id, row.netSpreadPct, 'sl', true);
+      if (cur <= tp) {
+        void close(t.id, cur, 'tp', true);
+        toast({ title: `📝 TP: ${t.symbol.replace(/USDT$/, '')}`, description: `спред сошёлся: ${(t.netEntry - cur).toFixed(2)}% прибыли`, duration: 7000 });
+      } else if (cur >= sl) {
+        void close(t.id, cur, 'sl', true);
         toast({ title: `📝 SL: ${t.symbol.replace(/USDT$/, '')}`, description: 'разрыв расширился против позиции', duration: 7000 });
       }
     }
@@ -131,7 +135,8 @@ export function PaperPanel({ scan }: { scan: ScanResponse | null }) {
 
   const manualClose = async (t: PaperTrade) => {
     const row = rowsRef.current.get(t.symbol);
-    await close(t.id, row?.netSpreadPct ?? t.netEntry, 'manual');
+    const cur = row ? netSpreadForPair(row, t.buyEx, t.sellEx) : null;
+    await close(t.id, cur ?? t.netEntry, 'manual');
   };
 
   const clearClosed = async () => {
@@ -245,8 +250,9 @@ export function PaperPanel({ scan }: { scan: ScanResponse | null }) {
           <tbody>
             {trades.map((t) => {
               const row = rowsRef.current.get(t.symbol);
-              const cur = t.status === 'open' ? row?.netSpreadPct : t.netExit;
-              const pnl = t.status === 'closed' ? t.pnlPct : row?.netSpreadPct != null ? t.netEntry - row.netSpreadPct : null;
+              const live = row ? netSpreadForPair(row, t.buyEx, t.sellEx) : null;
+              const cur = t.status === 'open' ? live : t.netExit;
+              const pnl = t.status === 'closed' ? t.pnlPct : live != null ? t.netEntry - live : null;
               return (
                 <tr key={t.id} className="border-b border-zinc-900/70">
                   <td className="px-3 py-1.5 tabular-nums text-zinc-500">

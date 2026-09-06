@@ -108,7 +108,10 @@ export function AlertCenter({ settings, paused, scan }: { settings: Settings; pa
   /* --- SSE-алерты по порогу спреда / скору --- */
   useEffect(() => {
     if (paused) return;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let stopped = false;
     const connect = () => {
+      if (stopped) return;
       esRef.current?.close();
       const qs = new URLSearchParams({
         threshold: String(cfgRef.current.thresholdPct),
@@ -177,11 +180,15 @@ export function AlertCenter({ settings, paused, scan }: { settings: Settings; pa
       });
       es.onerror = () => {
         es.close();
-        if (!pausedRef.current) setTimeout(connect, 5000); // реконнект
+        if (stopped || pausedRef.current) return;
+        if (reconnectTimer) clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(connect, 5000); // реконнект
       };
     };
     connect();
     return () => {
+      stopped = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
       esRef.current?.close();
       esRef.current = null;
     };

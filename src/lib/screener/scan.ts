@@ -42,7 +42,7 @@ interface CacheGlobal {
     tapes: Map<string, { ts: number; v: TapeTrade[] | null }>;
     liq: Map<string, { ts: number; v: LiqInfo | null }>;
     lsr: Map<string, { ts: number; v: LsrInfo | null }>;
-    scan: { ts: number; resp: ScanResponse } | null;
+    scan: { ts: number; top: number; refExchange: ExchangeId | 'auto'; resp: ScanResponse } | null;
   };
 }
 const g = globalThis as unknown as CacheGlobal;
@@ -364,8 +364,9 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
       }
       if (d15 == null) d15 = seriesStore.dOiPct(a.symbol, 15 * 60_000);
       if (d1h == null) d1h = seriesStore.dOiPct(a.symbol, 60 * 60_000);
-      if (d15 != null) dOi15 = dOi15 == null ? d15 : Math.max(dOi15, Math.abs(d15) * Math.sign(d15));
-      if (d1h != null) dOi1h = dOi1h == null ? d1h : Math.max(dOi1h, Math.abs(d1h) * Math.sign(d1h));
+      // берём самое сильное движение OI по модулю, сохраняя его знак (отток так же важен, как приток)
+      if (d15 != null && (dOi15 == null || Math.abs(d15) > Math.abs(dOi15))) dOi15 = d15;
+      if (d1h != null && (dOi1h == null || Math.abs(d1h) > Math.abs(dOi1h))) dOi1h = d1h;
       if (np != null && (natrMax == null || np > natrMax)) natrMax = np;
       if (vz != null && (volZMax == null || vz > volZMax)) volZMax = vz;
       if (sw && (!sweepBest || sw.ageMin < sweepBest.ageMin)) sweepBest = sw;
@@ -459,6 +460,7 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
     const illiqProxyV = illiqProxyOf(amihudV, turnoverMax, crossSpreadPct);
     const algoProxyV = algoProxyOf(volZMax, dOi15, sweepBest?.ageMin ?? null);
 
+    seriesStore.trackSignalAge(a.symbol, now, JOURNAL_THRESHOLD, netSpreadPct);
     const age = seriesStore.signalAge(a.symbol, now);
 
     rows.push({
@@ -512,7 +514,7 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
     // журнал: порог + cooldown
     if (netSpreadPct != null && netSpreadPct >= JOURNAL_THRESHOLD && bestBid && bestAsk) {
       if (seriesStore.getLastSignalTs(a.symbol) < now - JOURNAL_COOLDOWN) {
-        seriesStore.markSignal(a.symbol, now, JOURNAL_THRESHOLD, netSpreadPct);
+        seriesStore.markJournaled(a.symbol, now);
         appendJournal({
           ts: now,
           symbol: a.symbol,
@@ -760,12 +762,14 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
 }
 
 export async function getScan(top = TOP_DEFAULT, refExchange: ExchangeId | 'auto' = 'auto'): Promise<ScanResponse> {
-  if (cache.scan && Date.now() - cache.scan.ts < SCAN_TTL) {
-    const resp = cache.scan.resp;
-    return { ...resp, cached: true, refExchange };
+  const hit = cache.scan;
+  // параметры входят в ключ кэша: при другом top/refExchange строки нужно пересчитать,
+  // иначе вернём цифры, посчитанные против прежней эталонной биржи
+  if (hit && Date.now() - hit.ts < SCAN_TTL && hit.top === top && hit.refExchange === refExchange) {
+    return { ...hit.resp, cached: true };
   }
   const resp = await doScan(top, refExchange);
-  cache.scan = { ts: Date.now(), resp };
+  cache.scan = { ts: Date.now(), top, refExchange, resp };
   return resp;
 }
 

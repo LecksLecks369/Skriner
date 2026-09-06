@@ -70,9 +70,12 @@ function exportCsv(rows: CoinRow[]) {
 
 export default function Home() {
   const s = useScreener();
-  const [open, setOpen] = useState<CoinRow | null>(null);
+  // храним символ + снимок строки: сама строка берётся из свежего скана, чтобы модалка
+  // не замерзала на данных момента открытия; снимок — фолбэк, если монета вышла из топа
+  const [opened, setOpened] = useState<{ symbol: string; snapshot: CoinRow } | null>(null);
   const navIdx = useRef(0);
   const threshold = s.settings.thresholdPct;
+  const open = opened ? s.scan?.rows.find((r) => r.symbol === opened.symbol) ?? opened.snapshot : null;
 
   const filtered = useMemo(() => {
     if (!s.scan) return [];
@@ -101,14 +104,14 @@ export default function Home() {
         const rows = filteredRef.current;
         if (rows.length) {
           navIdx.current = Math.min(navIdx.current + 1, rows.length - 1);
-          setOpen(rows[navIdx.current]);
+          setOpened({ symbol: rows[navIdx.current].symbol, snapshot: rows[navIdx.current] });
         }
       } else if (e.key === 'k') {
         e.preventDefault();
         const rows = filteredRef.current;
         if (rows.length) {
           navIdx.current = Math.max(navIdx.current - 1, 0);
-          setOpen(rows[navIdx.current]);
+          setOpened({ symbol: rows[navIdx.current].symbol, snapshot: rows[navIdx.current] });
         }
       }
     };
@@ -190,7 +193,7 @@ export default function Home() {
                 watchlist={s.watchlist}
                 toggleWatch={s.toggleWatch}
                 threshold={threshold}
-                onOpen={setOpen}
+                onOpen={(r) => setOpened({ symbol: r.symbol, snapshot: r })}
               />
             )}
           </TabsContent>
@@ -213,7 +216,7 @@ export default function Home() {
         снапшоты и paper-сделки — на сервере.
       </footer>
 
-      <CoinModal key={open?.symbol || 'none'} row={open} threshold={threshold} onClose={() => setOpen(null)} />
+      <CoinModal key={open?.symbol || 'none'} row={open} threshold={threshold} onClose={() => setOpened(null)} />
       <AlertCenter settings={s.settings} paused={s.paused} scan={s.scan} />
     </div>
   );
