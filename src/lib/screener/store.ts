@@ -1,0 +1,397 @@
+import fs from 'fs';
+import path from 'path';
+import type { ExchangeId } from './types';
+
+/* Персистентный стор: переживает HMR и горячие перезапуски dev-сервера.
+   Серии хранятся в памяти, журнал сигналов — на диске (JSONL). */
+
+interface Pt {
+  ts: number;
+  v: number;
+}
+
+export interface Series {
+  prices: Record<string, Record<string, Pt[]>>; // symbol -> exchange -> [ts, price]
+  crossSpread: Record<string, Pt[]>; // symbol -> [ts, pct]
+  oi: Record<string, Record<string, Pt[]>>; // symbol -> exchange -> [ts, oi]
+  funding: Record<string, Record<string, Pt[]>>; // symbol -> exchange -> [ts, rate]
+  firstSignal: Record<string, number>; // symbol -> ts первого сигнала (спред >= порога)
+  lastSignalTs: Record<string, number>;
+}
+
+export interface JournalEntry {
+  ts: number;
+  symbol: string;
+  spreadPct: number;
+  netPct: number | null;
+  zScore: number | null;
+  score: number;
+  refExchange: ExchangeId;
+  hiExchange: ExchangeId;
+  loExchange: ExchangeId;
+  outcomeTs?: number;
+  outcomeConv?: boolean; // спред сошёлся за 30м
+}
+
+const MAX_PTS = 720; // 720 * 45с ≈ 9 часов истории
+const DATA_DIR = path.join(process.cwd(), 'data');
+const JOURNAL_FILE = path.join(DATA_DIR, 'signal_journal.jsonl');
+
+function newSeries(): Series {
+  return { prices: {}, crossSpread: {}, oi: {}, funding: {}, firstSignal: {}, lastSignalTs: {} };
+}
+
+interface StoreGlobal {
+  __screenerStore: { series: Series; journal: JournalEntry[]; journalLoaded: boolean };
+}
+const g = globalThis as unknown as StoreGlobal;
+if (!g.__screenerStore) {
+  g.__screenerStore = { series: newSeries(), journal: [], journalLoaded: false };
+}
+const store = g.__screenerStore;
+
+function pushPt(arr: Pt[] | undefined, ts: number, v: number): Pt[] {
+  const a = arr || [];
+  if (a.length && ts - a[a.length - 1].ts < 30_000 && Math.abs(a[a.length - 1].v - v) < 1e-12) return a;
+  a.push({ ts, v });
+  if (a.length > MAX_PTS) a.splice(0, a.length - MAX_PTS);
+  return a;
+}
+
+export const seriesStore = {
+  addPrice(symbol: string, ex: ExchangeId, ts: number, price: number) {
+    const s = (store.series.prices[symbol] ||= {});
+    s[ex] = pushPt(s[ex], ts, price);
+  },
+  addCrossSpread(symbol: string, ts: number, pct: number) {
+    store.series.crossSpread[symbol] = pushPt(store.series.crossSpread[symbol], ts, pct);
+  },
+  addOi(symbol: string, ex: ExchangeId, ts: number, oi: number) {
+    const s = (store.series.oi[symbol] ||= {});
+    s[ex] = pushPt(s[ex], ts, oi);
+  },
+  addFunding(symbol: string, ex: ExchangeId, ts: number, rate: number) {
+    const s = (store.series.funding[symbol] ||= {});
+    s[ex] = pushPt(s[ex], ts, rate);
+  },
+  getSpreadHistory(symbol: string): Pt[] {
+    return store.series.crossSpread[symbol] || [];
+  },
+  /** Все серии цен монеты по биржам (для оценки исходов паттернов) */
+  getPricePoints(symbol: string): Record<string, Pt[]> {
+    return store.series.prices[symbol] || {};
+  },
+  getPriceSeries(symbol: string, ex: ExchangeId): Pt[] {
+    return store.series.prices[symbol]?.[ex] || [];
+  },
+  /** ΔOI % за окно по объединению бирж (среднее по тем, у кого есть история) */
+  dOiPct(symbol: string, windowMs: number): number | null {
+    const per = store.series.oi[symbol];
+    if (!per) return null;
+    const now = Date.now();
+    const vals: number[] = [];
+    for (const ex of Object.keys(per)) {
+      const arr = per[ex];
+      if (!arr || arr.length < 2) continue;
+      const cur = arr[arr.length - 1];
+      // ищем точку ближе к окну
+      let base: Pt | null = null;
+      for (let i = arr.length - 1; i >= 0; i--) {
+        if (now - arr[i].ts >= windowMs) {
+          base = arr[i];
+          break;
+        }
+      }
+      if (!base || base.v <= 0) continue;
+      vals.push(((cur.v - base.v) / base.v) * 100);
+    }
+    if (!vals.length) return null;
+    return vals.reduce((a, b) => a + b, 0) / vals.length;
+  },
+  /** z-score текущего спреда против своей истории (последние 2-4 часа) */
+  spreadZScore(symbol: string, cur: number): number | null {
+    const arr = store.series.crossSpread[symbol];
+    if (!arr || arr.length < 15) return null;
+    const hist = arr.slice(-240).map((p) => p.v);
+    const n = hist.length;
+    const mean = hist.reduce((a, b) => a + b, 0) / n;
+    const varr = hist.reduce((a, b) => a + (b - mean) * (b - mean), 0) / n;
+    const std = Math.sqrt(varr);
+    if (std < 1e-6) return cur > mean + 0.05 ? 3.5 : null; // стабильный спред + внезапный скачок
+    return Math.max(-5, Math.min(8, (cur - mean) / std));
+  },
+  markSignal(symbol: string, ts: number, thresholdPct: number, spreadPct: number) {
+    if (spreadPct >= thresholdPct) {
+      if (!store.series.firstSignal[symbol]) store.series.firstSignal[symbol] = ts;
+      store.series.lastSignalTs[symbol] = ts;
+    } else {
+      delete store.series.firstSignal[symbol];
+    }
+  },
+  getLastSignalTs(symbol: string): number {
+    return store.series.lastSignalTs[symbol] || 0;
+  },
+  signalAge(symbol: string, now: number): number | null {
+    const t0 = store.series.firstSignal[symbol];
+    return t0 ? (now - t0) / 60000 : null;
+  },
+};
+
+/* --------- Журнал сигналов (персистентный) --------- */
+export function appendJournal(entry: JournalEntry) {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.appendFileSync(JOURNAL_FILE, JSON.stringify(entry) + '\n');
+    store.journal.push(entry);
+    if (store.journal.length > 5000) store.journal.splice(0, store.journal.length - 5000);
+  } catch {
+    /* диск недоступен — журнал в памяти */
+  }
+}
+
+function loadJournal(): JournalEntry[] {
+  if (store.journalLoaded) return store.journal;
+  store.journalLoaded = true;
+  try {
+    if (fs.existsSync(JOURNAL_FILE)) {
+      const lines = fs.readFileSync(JOURNAL_FILE, 'utf8').trim().split('\n').filter(Boolean);
+      store.journal = lines.slice(-5000).map((l) => JSON.parse(l) as JournalEntry);
+    }
+  } catch {
+    store.journal = [];
+  }
+  return store.journal;
+}
+
+/** Сводка журнала + доращивание исходов (спред сошёлся за 30 мин?) */
+export function journalSummary(): { signals24h: number; conv30m: number | null; total: number } {
+  const all = loadJournal();
+  const now = Date.now();
+  const dayAgo = now - 24 * 3600 * 1000;
+  // доращиваем исходы по истории спредов
+  let withOutcome = 0;
+  let conv = 0;
+  for (const e of all) {
+    if (e.outcomeConv !== undefined) {
+      withOutcome++;
+      if (e.outcomeConv) conv++;
+      continue;
+    }
+    if (now - e.ts < 30 * 60 * 1000) continue;
+    const hist = store.series.crossSpread[e.symbol];
+    if (!hist) continue;
+    const after = hist.filter((p) => p.ts > e.ts + 25 * 60 * 1000);
+    if (!after.length) continue;
+    const minAfter = Math.min(...after.map((p) => p.v));
+    e.outcomeTs = after[0].ts;
+    e.outcomeConv = minAfter <= e.spreadPct * 0.5;
+    withOutcome++;
+    if (e.outcomeConv) conv++;
+  }
+  const recent = all.filter((e) => e.ts >= dayAgo);
+  return {
+    signals24h: recent.length,
+    conv30m: withOutcome > 0 ? conv / withOutcome : null,
+    total: all.length,
+  };
+}
+
+export function recentSignals(limit = 60): JournalEntry[] {
+  const all = loadJournal();
+  return all.slice(-limit).reverse();
+}
+
+/* --------- Репутация монет: как часто её сигналы были верными --------- */
+export interface SymbolRep {
+  n: number;
+  winRate: number | null;
+}
+
+export function symbolReputation(): Record<string, SymbolRep> {
+  const all = loadJournal();
+  const acc: Record<string, { n: number; win: number; decided: number }> = {};
+  for (const e of all) {
+    const a = (acc[e.symbol] ||= { n: 0, win: 0, decided: 0 });
+    a.n++;
+    if (e.outcomeConv !== undefined) {
+      a.decided++;
+      if (e.outcomeConv) a.win++;
+    }
+  }
+  const out: Record<string, SymbolRep> = {};
+  for (const [sym, a] of Object.entries(acc)) {
+    out[sym] = {
+      n: a.n,
+      winRate: a.decided > 0 ? a.win / a.decided : null,
+    };
+  }
+  return out;
+}
+
+/* --------- Снапшоты для бэктеста фильтров --------- */
+/* Каждый свежий скан пишет одну строку: { ts, pts: [{s, net, hi, lo, pBuy, pSell, sc}] }.
+   Файл data/snapshots.jsonl — кольцевой (~36 часов), бэктест проигрывает фильтры по нему. */
+
+const SNAP_FILE = path.join(DATA_DIR, 'snapshots.jsonl');
+const SNAP_KEEP_MS = 36 * 3600 * 1000;
+const SNAP_MAX_LINES = 4000;
+
+export interface SnapPt {
+  s: string; // symbol
+  net: number; // нетто-спред %
+  hi: ExchangeId;
+  lo: ExchangeId;
+  pBuy: number;
+  pSell: number;
+  sc: number; // скор
+}
+
+export interface SnapLine {
+  ts: number;
+  pts: SnapPt[];
+}
+
+interface SnapGlobal {
+  __screenerSnaps: { lines: SnapLine[]; loaded: boolean; writes: number };
+}
+const sg = globalThis as unknown as SnapGlobal;
+if (!sg.__screenerSnaps) sg.__screenerSnaps = { lines: [], loaded: false, writes: 0 };
+const snapStore = sg.__screenerSnaps;
+
+function loadSnaps(): SnapLine[] {
+  if (snapStore.loaded) return snapStore.lines;
+  snapStore.loaded = true;
+  try {
+    if (fs.existsSync(SNAP_FILE)) {
+      const lines = fs.readFileSync(SNAP_FILE, 'utf8').trim().split('\n').filter(Boolean);
+      snapStore.lines = lines.slice(-SNAP_MAX_LINES).map((l) => JSON.parse(l) as SnapLine);
+    }
+  } catch {
+    snapStore.lines = [];
+  }
+  return snapStore.lines;
+}
+
+export function appendSnapshot(pts: SnapPt[]) {
+  const line: SnapLine = { ts: Date.now(), pts };
+  const arr = loadSnaps();
+  arr.push(line);
+  if (arr.length > SNAP_MAX_LINES) arr.splice(0, arr.length - SNAP_MAX_LINES);
+  snapStore.writes++;
+  // периодическая обрезка файла по времени
+  if (snapStore.writes % 100 === 0) {
+    const cutoff = Date.now() - SNAP_KEEP_MS;
+    while (arr.length && arr[0].ts < cutoff) arr.shift();
+    try {
+      if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+      fs.writeFileSync(SNAP_FILE, arr.map((l) => JSON.stringify(l)).join('\n') + '\n');
+      return;
+    } catch {
+      /* диск недоступен — держим в памяти */
+    }
+  }
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.appendFileSync(SNAP_FILE, JSON.stringify(line) + '\n');
+  } catch {
+    /* диск недоступен */
+  }
+}
+
+export function loadSnapshotLines(hours: number): SnapLine[] {
+  const cutoff = Date.now() - Math.min(hours, 48) * 3600 * 1000;
+  return loadSnaps().filter((l) => l.ts >= cutoff);
+}
+
+/* --------- Прогрев: сериализация серий на диск ---------
+   После рестарта сервера серии в памяти пусты и z-score/ΔOI/возраст набираются ~час.
+   Периодически пишем весь Series в data/series.json, при старте — восстанавливаем.
+   Потеря при жёстком убийстве процесса ≤ ~2 минут истории. */
+
+const SERIES_FILE = path.join(DATA_DIR, 'series.json');
+const SERIES_KEEP_MS = 10 * 3600 * 1000; // старше 10ч — чистим при записи
+const PERSIST_DELAY_MS = 90_000;
+
+interface WarmGlobal {
+  __screenerSeriesWarm: { loaded: boolean; timer: ReturnType<typeof setTimeout> | null; writing: boolean };
+}
+const wg = globalThis as unknown as WarmGlobal;
+if (!wg.__screenerSeriesWarm) wg.__screenerSeriesWarm = { loaded: false, timer: null, writing: false };
+const warm = wg.__screenerSeriesWarm;
+
+function prunePts(arr: Pt[] | undefined, cutoff: number): Pt[] {
+  if (!arr) return [];
+  return arr.filter((p) => p.ts >= cutoff).slice(-MAX_PTS);
+}
+
+/** Восстановить серии с диска (один раз за процесс, до первой записи). */
+export function warmupSeries() {
+  if (warm.loaded) return;
+  warm.loaded = true;
+  // серии уже живут (HMR того же процесса) — грузить нечем
+  if (Object.keys(store.series.prices).length > 0) return;
+  try {
+    if (!fs.existsSync(SERIES_FILE)) return;
+    const raw = JSON.parse(fs.readFileSync(SERIES_FILE, 'utf8')) as Series;
+    const cutoff = Date.now() - SERIES_KEEP_MS;
+    const next = newSeries();
+    for (const [sym, per] of Object.entries(raw.prices || {})) {
+      const np: Record<string, Pt[]> = {};
+      for (const [ex, arr] of Object.entries(per)) {
+        const pr = prunePts(arr, cutoff);
+        if (pr.length) np[ex] = pr;
+      }
+      if (Object.keys(np).length) next.prices[sym] = np;
+    }
+    for (const [sym, arr] of Object.entries(raw.crossSpread || {})) {
+      const pr = prunePts(arr, cutoff);
+      if (pr.length) next.crossSpread[sym] = pr;
+    }
+    for (const [sym, per] of Object.entries(raw.oi || {})) {
+      const np: Record<string, Pt[]> = {};
+      for (const [ex, arr] of Object.entries(per)) {
+        const pr = prunePts(arr, cutoff);
+        if (pr.length) np[ex] = pr;
+      }
+      if (Object.keys(np).length) next.oi[sym] = np;
+    }
+    for (const [sym, per] of Object.entries(raw.funding || {})) {
+      const np: Record<string, Pt[]> = {};
+      for (const [ex, arr] of Object.entries(per)) {
+        const pr = prunePts(arr, cutoff);
+        if (pr.length) np[ex] = pr;
+      }
+      if (Object.keys(np).length) next.funding[sym] = np;
+    }
+    next.firstSignal = raw.firstSignal || {};
+    next.lastSignalTs = raw.lastSignalTs || {};
+    // метки сигналов старше часа не имеют смысла
+    const hourAgo = Date.now() - 3600_000;
+    for (const [sym, ts] of Object.entries(next.firstSignal)) if (ts < hourAgo) delete next.firstSignal[sym];
+    store.series = next;
+    const nSym = Object.keys(next.crossSpread).length;
+    console.log(`[warmup] series восстановлены: ${nSym} монет с диска (z-score готов сразу)`);
+  } catch {
+    /* битый файл — стартуем с пустых серий */
+  }
+}
+
+/** Отложенная запись серий на диск (вызывается после каждого свежего скана). */
+export function scheduleSeriesPersist() {
+  if (warm.timer || warm.writing) return;
+  warm.timer = setTimeout(() => {
+    warm.timer = null;
+    warm.writing = true;
+    try {
+      if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+      fs.writeFileSync(SERIES_FILE, JSON.stringify(store.series));
+    } catch {
+      /* диск недоступен — пропускаем цикл */
+    } finally {
+      warm.writing = false;
+    }
+  }, PERSIST_DELAY_MS);
+  // не держим процесс ради записи
+  if (typeof warm.timer === 'object' && warm.timer && 'unref' in warm.timer) warm.timer.unref?.();
+}
+
