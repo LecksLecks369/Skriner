@@ -177,7 +177,8 @@ export async function GET(req: NextRequest) {
   // ранжирование: матожидание × значимость (√числа сделок)
   const rank = (r: ComboResult) => (r.avgPnl != null ? r.avgPnl * Math.sqrt(Math.max(1, r.decided)) : -99);
   const eligible = results.filter((r) => r.decided >= minDecided);
-  const best = (eligible.length ? eligible : results).sort((a, b) => rank(b) - rank(a)).slice(0, 6);
+  // копия перед сортировкой: `results` может быть массивом из кэша, его нельзя переупорядочивать
+  const best = [...(eligible.length ? eligible : results)].sort((a, b) => rank(b) - rank(a)).slice(0, 6);
 
   const nearTh = THRESHOLDS.reduce((p, c) => (Math.abs(c - curThreshold) < Math.abs(p - curThreshold) ? c : p), THRESHOLDS[0]);
   const nearSc = SCORES.includes(curScore) ? curScore : 0;

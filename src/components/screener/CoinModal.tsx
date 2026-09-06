@@ -227,7 +227,13 @@ function PaperSection({ row }: { row: CoinRow }) {
               </span>
               {t.status === 'open' ? (
                 <>
-                  <span className="font-mono text-zinc-400">сейчас {row.netSpreadPct != null ? `${row.netSpreadPct.toFixed(2)}%` : '—'}</span>
+                  {/* показываем спред тех же ног, по которым сделка и закроется */}
+                  <span className="font-mono text-zinc-400">
+                    сейчас {(() => {
+                      const cur = netSpreadForPair(row, t.buyEx, t.sellEx);
+                      return cur != null ? `${cur.toFixed(2)}%` : '—';
+                    })()}
+                  </span>
                   <button className="rounded border border-zinc-700 px-1.5 py-0.5 text-zinc-400 hover:text-zinc-200" disabled={busy} onClick={() => close(t)}>
                     закрыть
                   </button>

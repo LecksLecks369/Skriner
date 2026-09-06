@@ -42,7 +42,7 @@ interface CacheGlobal {
     tapes: Map<string, { ts: number; v: TapeTrade[] | null }>;
     liq: Map<string, { ts: number; v: LiqInfo | null }>;
     lsr: Map<string, { ts: number; v: LsrInfo | null }>;
-    scan: { ts: number; top: number; refExchange: ExchangeId | 'auto'; resp: ScanResponse } | null;
+    scan: { ts: number; top: number; resp: ScanResponse } | null;
   };
 }
 const g = globalThis as unknown as CacheGlobal;
@@ -597,6 +597,9 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
     }
   }
 
+  // монеты, выпавшие из топа, больше не наблюдаются — снимаем их метки возраста сигнала
+  seriesStore.dropSignalAgesExcept(new Set(rows.map((r) => r.symbol)));
+
   // 5a. НЕЛИКВИД: deep-блок (стакан + лента) для топ-40 по скору
   const aggBySym = new Map(ranked.map((x) => [x.a.symbol, x.a]));
   const deepTargets = [...rows].sort((x, y) => y.score - x.score).slice(0, 40);
@@ -763,13 +766,16 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
 
 export async function getScan(top = TOP_DEFAULT, refExchange: ExchangeId | 'auto' = 'auto'): Promise<ScanResponse> {
   const hit = cache.scan;
-  // параметры входят в ключ кэша: при другом top/refExchange строки нужно пересчитать,
-  // иначе вернём цифры, посчитанные против прежней эталонной биржи
-  if (hit && Date.now() - hit.ts < SCAN_TTL && hit.top === top && hit.refExchange === refExchange) {
+  // Ключ кэша — только top. refExchange влияет лишь на refSpreadPct, а вызовы идут с разными
+  // значениями (главная — с выбранной биржей, radar/liquidity/ai-comment — с 'auto'), поэтому
+  // ключ с refExchange заставлял бы их вытеснять друг друга и гонять полный doScan на каждый
+  // запрос, попутно дублируя снапшоты и записи журнала.
+  if (hit && Date.now() - hit.ts < SCAN_TTL && hit.top === top) {
+    // ярлык не переклеиваем: в ответе остаётся та биржа, против которой строки реально посчитаны
     return { ...hit.resp, cached: true };
   }
   const resp = await doScan(top, refExchange);
-  cache.scan = { ts: Date.now(), top, refExchange, resp };
+  cache.scan = { ts: Date.now(), top, resp };
   return resp;
 }
 

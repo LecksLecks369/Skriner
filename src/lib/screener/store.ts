@@ -133,6 +133,13 @@ export const seriesStore = {
   markJournaled(symbol: string, ts: number) {
     store.series.lastSignalTs[symbol] = ts;
   },
+  /** Снять метки возраста у монет, которых нет в текущем скане: их спред мы больше не наблюдаем,
+      иначе метка висит до перезапуска и при возврате монеты в топ покажет фиктивный возраст */
+  dropSignalAgesExcept(symbols: Set<string>) {
+    for (const sym of Object.keys(store.series.firstSignal)) {
+      if (!symbols.has(sym)) delete store.series.firstSignal[sym];
+    }
+  },
   getLastSignalTs(symbol: string): number {
     return store.series.lastSignalTs[symbol] || 0;
   },
