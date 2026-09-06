@@ -297,13 +297,29 @@ export function assembleDeep(inp: DeepInput): LiquidityDeep {
     if (depth25 == null || d.depth25Usd < depth25) depth25 = d.depth25Usd;
   }
   /* Стоимость круга по стакану: покупка на entryEx + продажа на exitEx.
-     ExDepth.slip25kPct — худшая сторона своей биржи, поэтому сумма двух ног
+     ExDepth.slipNkPct — худшая сторона своей биржи, поэтому сумма двух ног
      даёт консервативную (не заниженную) оценку. Если стакана одной из ног нет,
-     возвращаем null: половина круга занизила бы издержки. */
-  const slipEntry = inp.entryEx ? inp.depths[inp.entryEx]?.slip25kPct ?? null : null;
-  const slipExit = inp.exitEx ? inp.depths[inp.exitEx]?.slip25kPct ?? null : null;
-  const slipRoundTrip =
-    slipEntry != null && slipExit != null ? Math.round((slipEntry + slipExit) * 1000) / 1000 : null;
+     возвращаем null: половина круга занизила бы издержки.
+
+     Бюджет спускаем с $25k до $10k: слипейдж на $25k равен null, когда книга
+     мельче ордера, и тогда монета осталась бы «без измеренных издержек» именно
+     из-за того, что она неликвидная. Если и $10k не набирается — null остаётся,
+     и скоринг не даёт за такой спред баллов. */
+  const budgets: Array<[number, 'slip25kPct' | 'slip10kPct']> = [
+    [25_000, 'slip25kPct'],
+    [10_000, 'slip10kPct'],
+  ];
+  let slipRoundTrip: number | null = null;
+  let slipBudgetUsd: number | null = null;
+  for (const [usd, key] of budgets) {
+    const e = inp.entryEx ? inp.depths[inp.entryEx]?.[key] ?? null : null;
+    const x = inp.exitEx ? inp.depths[inp.exitEx]?.[key] ?? null : null;
+    if (e != null && x != null) {
+      slipRoundTrip = Math.round((e + x) * 1000) / 1000;
+      slipBudgetUsd = usd;
+      break;
+    }
+  }
   const algo = algoScoreOf({ tape: inp.tape, volZ: inp.volZ, dOiPct15m: inp.dOiPct15m, sweepAgeMin: inp.sweepAgeMin });
   const illiq = illiqScoreOf(depth25, slip25k, inp.amihud, inp.turnoverUsd);
   const pattern = buildPattern(algo, illiq, inp.netSpreadPct, inp.crossSpreadPct, inp.tape, depth25, slip25k, inp.dOiPct15m);
@@ -314,6 +330,7 @@ export function assembleDeep(inp: DeepInput): LiquidityDeep {
     exitEx: inp.exitEx,
     slip25kPct: slip25k,
     slipRoundTripPct: slipRoundTrip,
+    slipBudgetUsd,
     maxPosUsd: maxPos,
     tape: inp.tape,
     tapeEx: inp.tapeEx,

@@ -19,7 +19,9 @@ export const EXCHANGES: ExchangeInfo[] = [
 export interface RawTicker {
   symbol: string; // нормализованный: BTCUSDT
   nativeSymbol: string; // как на бирже
-  price: number;
+  price: number; // цена последней сделки — НЕ котировка, торговать по ней нельзя
+  bid: number | null; // лучший bid стакана (по нему продают)
+  ask: number | null; // лучший ask стакана (по нему покупают)
   turnoverUsd: number; // 24h объём в USDT
   fundingRate?: number | null;
   oi?: number | null; // open interest в монетах
@@ -62,7 +64,9 @@ export interface SweepSignal {
 
 export interface ExchangeRow {
   exchange: ExchangeId;
-  price: number;
+  price: number; // последняя сделка (для отображения)
+  bid: number | null; // лучший bid — по нему продают
+  ask: number | null; // лучший ask — по нему покупают
   fundingRate: number | null;
   oiUsd: number | null;
   dOiPct5m: number | null;
@@ -86,6 +90,7 @@ export interface CoinRow {
   refSpreadPct: number | null; // спред vs эталонной биржи
   netSpreadPct: number | null; // кросс-спред минус taker-комиссии обеих сторон
   netExecPct: number | null; // исполнимый спред: netSpreadPct минус проскальзывание обеих ног (только там, где есть deep)
+  quoteBased: boolean; // спред построен по bid/ask минимум двух бирж; false = котировок не хватило, спреда нет
   zScore: number | null; // аномальность спреда против своей истории
   spreadAgeMin: number | null; // сколько минут спред ≥ порога
   score: number; // 0..100
@@ -161,7 +166,8 @@ export interface LiquidityDeep {
   entryEx: ExchangeId | null; // где купить дешевле (bestAsk)
   exitEx: ExchangeId | null; // где продать дороже (bestBid)
   slip25kPct: number | null; // худший слипейдж $25k среди entry/exit
-  slipRoundTripPct: number | null; // слипейдж обеих ног круга ($25k): вход + выход, %
+  slipRoundTripPct: number | null; // слипейдж обеих ног круга: вход + выход, %
+  slipBudgetUsd: number | null; // на каком объёме измерен slipRoundTripPct ($25k, иначе $10k)
   maxPosUsd: number | null; // минимальный безопасный размер среди entry/exit
   tape: TapeStats | null;
   tapeEx: ExchangeId | null;

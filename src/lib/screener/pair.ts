@@ -8,8 +8,10 @@ const FEE = Object.fromEntries(EXCHANGES.map((e) => [e.id, e.takerFee])) as Reco
  * поэтому для P&L и TP/SL открытой позиции нужен спред её собственных ног.
  */
 export function netSpreadForPair(row: CoinRow, buyEx: ExchangeId, sellEx: ExchangeId): number | null {
-  const buy = row.exchanges.find((e) => e.exchange === buyEx)?.price;
-  const sell = row.exchanges.find((e) => e.exchange === sellEx)?.price;
+  // покупка идёт в ask биржи входа, продажа — в bid биржи выхода;
+  // last-цены здесь дали бы спред, которого в книгах нет
+  const buy = row.exchanges.find((e) => e.exchange === buyEx)?.ask;
+  const sell = row.exchanges.find((e) => e.exchange === sellEx)?.bid;
   if (!buy || !sell || buy <= 0) return null;
   const gross = ((sell - buy) / buy) * 100;
   return gross - (FEE[buyEx] + FEE[sellEx]) * 100;

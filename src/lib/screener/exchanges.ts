@@ -19,6 +19,12 @@ async function fetchJson<T>(url: string, timeoutMs = 9000): Promise<T> {
   }
 }
 
+/** Число из поля тикера; null, если поля нет или оно не положительное */
+function numOrNull(v: unknown): number | null {
+  const n = typeof v === 'number' ? v : parseFloat(String(v ?? ''));
+  return isFinite(n) && n > 0 ? n : null;
+}
+
 export function normalizeSymbol(ex: ExchangeId, native: string): string {
   if (ex === 'bybit' || ex === 'bitget') return native; // BTCUSDT
   if (ex === 'bingx') return native.replace('-', ''); // BTC-USDT -> BTCUSDT
@@ -44,6 +50,8 @@ async function fetchBybit(): Promise<ExchangeFetchResult> {
       symbol: normalizeSymbol('bybit', t.symbol),
       nativeSymbol: t.symbol,
       price,
+      bid: numOrNull(t.bid1Price),
+      ask: numOrNull(t.ask1Price),
       turnoverUsd: turnover,
       fundingRate: t.fundingRate ? parseFloat(t.fundingRate) : null,
       oi: t.openInterest ? parseFloat(t.openInterest) : null,
@@ -90,6 +98,8 @@ async function fetchBingx(): Promise<ExchangeFetchResult> {
       symbol: normalizeSymbol('bingx', t.symbol),
       nativeSymbol: t.symbol,
       price,
+      bid: numOrNull(t.bidPrice),
+      ask: numOrNull(t.askPrice),
       turnoverUsd: turnover,
       fundingRate: null,
       oi: null,
@@ -181,6 +191,8 @@ async function fetchOkx(): Promise<ExchangeFetchResult> {
       symbol: normalizeSymbol('okx', t.instId),
       nativeSymbol: t.instId,
       price,
+      bid: numOrNull(t.bidPx),
+      ask: numOrNull(t.askPx),
       turnoverUsd: baseVol * price,
       fundingRate: null,
       oi: null,
@@ -249,6 +261,8 @@ async function fetchBitget(): Promise<ExchangeFetchResult> {
       symbol: normalizeSymbol('bitget', t.symbol),
       nativeSymbol: t.symbol,
       price,
+      bid: numOrNull(t.bidPr),
+      ask: numOrNull(t.askPr),
       turnoverUsd: turnover,
       fundingRate: t.fundingRate ? parseFloat(t.fundingRate) : null,
       oi: t.holdingAmount ? parseFloat(t.holdingAmount) : null,
@@ -311,6 +325,8 @@ async function fetchMexc(): Promise<ExchangeFetchResult> {
       symbol: normalizeSymbol('mexc', symbol),
       nativeSymbol: symbol,
       price,
+      bid: numOrNull(t.bid1),
+      ask: numOrNull(t.ask1),
       turnoverUsd: turnover,
       fundingRate: t.fundingRate != null ? Number(t.fundingRate) : null,
       oi: t.holdVol != null ? Number(t.holdVol) : null,
@@ -365,6 +381,8 @@ async function fetchOurbit(): Promise<ExchangeFetchResult> {
       symbol: normalizeSymbol('ourbit', t.symbol || t.instId || ''),
       nativeSymbol: t.symbol || t.instId || '',
       price,
+      bid: numOrNull(t.bidPrice ?? t.bid1 ?? t.bidPx),
+      ask: numOrNull(t.askPrice ?? t.ask1 ?? t.askPx),
       turnoverUsd: parseFloat(t.quoteVolume || t.turnover24h || '0'),
       fundingRate: null,
       oi: null,

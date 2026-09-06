@@ -94,11 +94,12 @@ const SLIP_BUDGET_USD = 25_000;
 
 /**
  * Исполнимый спред: нетто минус проскальзывание обеих ног круга.
- * Без данных стакана возвращает исходный нетто-спред (поведение как раньше).
+ * null, если проскальзывание неизвестно — в том числе когда стакан измерялся,
+ * но не смог набрать нужный объём. Возвращать здесь сырой нетто нельзя:
+ * это давало бы самым тонким книгам вид самых исполнимых.
  */
 export function execSpreadPct(netSpreadPct: number | null, slipRoundTripPct: number | null | undefined): number | null {
-  if (netSpreadPct == null) return null;
-  if (slipRoundTripPct == null) return netSpreadPct;
+  if (netSpreadPct == null || slipRoundTripPct == null) return null;
   return Math.max(0, netSpreadPct - slipRoundTripPct);
 }
 
@@ -159,8 +160,15 @@ export function computeScore(inp: ScoreInput): ScoreResult {
   // и с поправкой на размер, который стакан вообще тянет. Без данных стакана —
   // как раньше, по топу книги.
   let multi = 0;
-  const netExec = execSpreadPct(inp.netSpreadPct, inp.slipRoundTripPct);
-  if (netExec != null) multi += Math.min(10, (netExec / 0.6) * 10) * sizeViability(inp.maxPosUsd); // 0.6% нетто — максимум
+  if (inp.slipRoundTripPct === undefined) {
+    // стакан не запрашивался (монета вне deep-топа) — как раньше, по котировкам
+    if (inp.netSpreadPct != null) multi += Math.min(10, (inp.netSpreadPct / 0.6) * 10); // 0.6% нетто — максимум
+  } else {
+    // стакан запрашивался: null означает, что книга не набрала объём даже на
+    // минимальный бюджет — спред неисполним, баллов за него нет
+    const netExec = execSpreadPct(inp.netSpreadPct, inp.slipRoundTripPct);
+    if (netExec != null) multi += Math.min(10, (netExec / 0.6) * 10) * sizeViability(inp.maxPosUsd);
+  }
   if (inp.zScore != null && inp.zScore > 0) multi += Math.min(6, (inp.zScore / 3) * 6);
   multi += Math.min(4, Math.max(0, (inp.coverage - 1) * 1.3)); // 2 биржи=1.3, 4 биржи=3.9
   parts.multi = multi;

@@ -182,7 +182,7 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
   // 1. Объединение тикеров по нормализованному символу
   interface Agg {
     symbol: string;
-    per: Map<ExchangeId, { native: string; price: number; turnover: number; funding: number | null; oi: number | null; oiUsd: number | null; nfTs: number | null }>;
+    per: Map<ExchangeId, { native: string; price: number; bid: number | null; ask: number | null; turnover: number; funding: number | null; oi: number | null; oiUsd: number | null; nfTs: number | null }>;
   }
   const agg = new Map<string, Agg>();
   for (const ex of okExchanges) {
@@ -196,6 +196,8 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
       a.per.set(ex.id, {
         native: t.nativeSymbol,
         price: t.price,
+        bid: t.bid ?? null,
+        ask: t.ask ?? null,
         turnover: t.turnoverUsd,
         funding: t.fundingRate ?? null,
         oi: t.oi ?? null,
@@ -308,7 +310,8 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
     const hi = prices[prices.length - 1];
     const lo = prices[0];
     const mid = (hi + lo) / 2;
-    const crossSpreadPct = hi > 0 ? ((hi - lo) / ((hi + lo) / 2)) * 100 : null;
+    // разброс last-цен; ниже заменяется на разрыв котировок, если он известен
+    let crossSpreadPct = hi > 0 ? ((hi - lo) / ((hi + lo) / 2)) * 100 : null;
 
     // эталонная биржа
     let refEx: ExchangeId;
@@ -320,18 +323,28 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
     const refSpreadPct =
       refPrice > 0 ? (Math.max(Math.abs(hi - refPrice), Math.abs(lo - refPrice)) / refPrice) * 100 : null;
 
-    // нетто-спред: лучшие bid/ask между биржами
+    /* Нетто-спред строится по КОТИРОВКАМ, а не по ценам последних сделок:
+       продаём в чужой bid, покупаем в чужой ask. Спред из last-цен измеряет
+       расхождение времени последних принтов, а не разрыв котировок, и регулярно
+       показывает разрыв там, где книги перекрываются. Биржа без котировок в
+       спред не допускается: её last-цена дала бы фантомный разрыв. */
     let bestBid: { exchange: ExchangeId; price: number } | undefined;
     let bestAsk: { exchange: ExchangeId; price: number } | undefined;
+    let quotedVenues = 0;
     for (const [exId, p] of a.per) {
-      if (!bestBid || p.price > bestBid.price) bestBid = { exchange: exId, price: p.price };
-      if (!bestAsk || p.price < bestAsk.price) bestAsk = { exchange: exId, price: p.price };
+      if (p.bid == null || p.ask == null) continue;
+      quotedVenues++;
+      if (!bestBid || p.bid > bestBid.price) bestBid = { exchange: exId, price: p.bid };
+      if (!bestAsk || p.ask < bestAsk.price) bestAsk = { exchange: exId, price: p.ask };
     }
+    const quoteBased = quotedVenues >= 2;
     let netSpreadPct: number | null = null;
-    if (bestBid && bestAsk && bestBid.exchange !== bestAsk.exchange) {
+    if (quoteBased && bestBid && bestAsk && bestBid.exchange !== bestAsk.exchange) {
       const gross = ((bestBid.price - bestAsk.price) / bestAsk.price) * 100;
       const fees = (feeById[bestBid.exchange] + feeById[bestAsk.exchange]) * 100;
       netSpreadPct = gross - fees;
+      // разрыв котировок вытесняет разброс last-цен: отрицательный = книги перекрываются
+      crossSpreadPct = gross;
     }
 
     // серии в стор
@@ -379,6 +392,8 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
       exRows.push({
         exchange: exId,
         price: p.price,
+        bid: p.bid,
+        ask: p.ask,
         fundingRate: p.funding ?? ext?.funding ?? null,
         oiUsd: p.oiUsd ?? (p.oi != null ? p.oi * p.price : ext?.oi != null ? ext.oi * p.price : null),
         dOiPct5m: null,
@@ -481,6 +496,7 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
       refSpreadPct,
       netSpreadPct,
       netExecPct: null, // заполняется после deep-блока, когда известен стакан обеих ног
+      quoteBased,
       zScore,
       spreadAgeMin: age != null ? Math.round(age) : null,
       score: sc.score,
@@ -762,7 +778,9 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
   scheduleSeriesPersist();
   const statuses: ExchangeStatus[] = EXCHANGES.map((e) => {
     const r = tickers[e.id];
-    const ageSec = r ? Math.round((now - r.fetchedAt) / 1000) : 0;
+    // возраст считаем от текущего момента: `now` снят до фетчей, из-за чего
+    // ageSec выходил отрицательным и флаг stale не срабатывал никогда
+    const ageSec = r ? Math.max(0, Math.round((Date.now() - r.fetchedAt) / 1000)) : 0;
     return {
       exchange: e.id,
       ok: !!r?.ok,
