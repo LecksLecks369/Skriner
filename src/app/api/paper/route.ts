@@ -85,7 +85,11 @@ export async function GET() {
     if (t.closedTs) { holdSum += (t.closedTs - t.ts) / 60000; holdN++; }
   }
   const sortedByPnl = [...closedSorted].sort((a, b) => (b.pnlPct ?? 0) - (a.pnlPct ?? 0));
+  // сколько закрытых сделок посчитано без стакана — на эту долю статистика оптимистична
+  const unmodeled = closedSorted.filter((t) => !t.slipModeled).length;
   const analytics = {
+    slipUnmodeled: unmodeled,
+    slipUnmodeledPct: closedSorted.length ? Number((unmodeled / closedSorted.length).toFixed(2)) : null,
     profitFactor: grossLoss > 0 ? Number((grossWin / grossLoss).toFixed(2)) : grossWin > 0 ? null : 0,
     expectancy: pnls.length ? Number((pnls.reduce((s, p) => s + p, 0) / pnls.length).toFixed(3)) : null,
     avgWin: winsArr.length ? Number((grossWin / winsArr.length).toFixed(3)) : null,
@@ -141,7 +145,15 @@ export async function POST(req: NextRequest) {
       tr.status = 'closed';
       tr.closedTs = Date.now();
       tr.netExit = body.netExit;
-      tr.pnlPct = Number((tr.netEntry - tr.netExit).toFixed(4));
+      const gross = tr.netEntry - tr.netExit;
+      tr.pnlGrossPct = Number(gross.toFixed(4));
+      /* Симулятор обязан «проедать стакан»: круг пересекает обе книги дважды —
+         на входе (покупка+продажа) и на выходе (обратные ноги). slipRoundTripPct —
+         стоимость одного такого пересечения, поэтому вычитаем её дважды.
+         Если стакана на входе не было (slipModeled=false) — P&L остаётся валовым
+         и завышенным ровно на величину неучтённого проскальзывания. */
+      const slipCost = tr.slipRoundTripPct != null ? tr.slipRoundTripPct * 2 : 0;
+      tr.pnlPct = Number((gross - slipCost).toFixed(4));
       tr.closeReason = body.reason || 'manual';
       save();
       return NextResponse.json({ ok: true, trade: tr });
@@ -151,6 +163,12 @@ export async function POST(req: NextRequest) {
     if (!body.symbol || !body.buyEx || !body.sellEx || body.pBuy == null || body.pSell == null || body.netEntry == null) {
       return NextResponse.json({ error: 'неполные данные сделки' }, { status: 400 });
     }
+    // глубина стакана на входе: без неё P&L считается по цене спреда, как будто
+    // позиция любого размера исполняется по топу книги
+    const slipRt =
+      typeof body.slipRoundTripPct === 'number' && Number.isFinite(body.slipRoundTripPct) && body.slipRoundTripPct >= 0
+        ? Number(body.slipRoundTripPct.toFixed(4))
+        : null;
     const trade: PaperTrade = {
       id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
       ts: Date.now(),
@@ -162,6 +180,9 @@ export async function POST(req: NextRequest) {
       netEntry: Number(body.netEntry.toFixed(4)),
       score: body.score ?? 0,
       status: 'open',
+      sizeUsd: typeof body.sizeUsd === 'number' && Number.isFinite(body.sizeUsd) ? body.sizeUsd : undefined,
+      slipRoundTripPct: slipRt ?? undefined,
+      slipModeled: slipRt != null,
     };
     trades.push(trade);
     if (trades.length > 500) store.trades = trades.slice(-500);

@@ -85,6 +85,7 @@ export interface CoinRow {
   crossSpreadPct: number | null; // (max-min)/mid * 100
   refSpreadPct: number | null; // спред vs эталонной биржи
   netSpreadPct: number | null; // кросс-спред минус taker-комиссии обеих сторон
+  netExecPct: number | null; // исполнимый спред: netSpreadPct минус проскальзывание обеих ног (только там, где есть deep)
   zScore: number | null; // аномальность спреда против своей истории
   spreadAgeMin: number | null; // сколько минут спред ≥ порога
   score: number; // 0..100
@@ -160,6 +161,7 @@ export interface LiquidityDeep {
   entryEx: ExchangeId | null; // где купить дешевле (bestAsk)
   exitEx: ExchangeId | null; // где продать дороже (bestBid)
   slip25kPct: number | null; // худший слипейдж $25k среди entry/exit
+  slipRoundTripPct: number | null; // слипейдж обеих ног круга ($25k): вход + выход, %
   maxPosUsd: number | null; // минимальный безопасный размер среди entry/exit
   tape: TapeStats | null;
   tapeEx: ExchangeId | null;
@@ -206,8 +208,13 @@ export interface PaperTrade {
   status: 'open' | 'closed';
   closedTs?: number;
   netExit?: number; // нетто-спред на выходе, %
-  pnlPct?: number; // netEntry - netExit (прибыль спред-трейда на круг, % от номинала)
+  pnlGrossPct?: number; // netEntry - netExit, без учёта проскальзывания
+  pnlPct?: number; // итоговый P&L: gross минус проскальзывание входа и выхода, % от номинала
   closeReason?: 'tp' | 'sl' | 'manual';
+  /* Учёт глубины стакана: без него симулятор считает спред полностью исполнимым любым размером */
+  sizeUsd?: number; // размер позиции, на который оценивался слипейдж (по умолчанию $25k)
+  slipRoundTripPct?: number; // слипейдж обеих ног на входе (из deep-блока), %
+  slipModeled?: boolean; // false = стакан был недоступен, P&L завышен на величину слипейджа
 }
 
 export interface ScanResponse {

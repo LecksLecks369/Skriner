@@ -83,6 +83,35 @@ export interface ScoreInput {
   zScore: number | null;
   coverage: number;
   fundingAbs: number | null;
+  /* Глубина стакана (есть только у монет с deep-блоком). Когда не передана —
+     спред засчитывается по топу книги, как раньше. */
+  slipRoundTripPct?: number | null; // проскальзывание обеих ног круга, %
+  maxPosUsd?: number | null; // размер, который стакан тянет со слипейджем ≤0.3%
+}
+
+/** Размер, на котором меряется слипейдж в ExDepth ($25k) — база для оценки исполнимости */
+const SLIP_BUDGET_USD = 25_000;
+
+/**
+ * Исполнимый спред: нетто минус проскальзывание обеих ног круга.
+ * Без данных стакана возвращает исходный нетто-спред (поведение как раньше).
+ */
+export function execSpreadPct(netSpreadPct: number | null, slipRoundTripPct: number | null | undefined): number | null {
+  if (netSpreadPct == null) return null;
+  if (slipRoundTripPct == null) return netSpreadPct;
+  return Math.max(0, netSpreadPct - slipRoundTripPct);
+}
+
+/**
+ * Поправка на размер: спред на $2k книги и спред на $25k книги — разные вещи.
+ * 1 при maxPosUsd ≥ $25k, линейно к 0 при ≤ $2k. Без данных — 1 (не штрафуем).
+ */
+export function sizeViability(maxPosUsd: number | null | undefined): number {
+  if (maxPosUsd == null) return 1;
+  const floor = 2_000;
+  if (maxPosUsd >= SLIP_BUDGET_USD) return 1;
+  if (maxPosUsd <= floor) return 0;
+  return (maxPosUsd - floor) / (SLIP_BUDGET_USD - floor);
 }
 
 export interface ScoreResult {
@@ -126,8 +155,12 @@ export function computeScore(inp: ScoreInput): ScoreResult {
   parts.volume = inp.volZ != null ? Math.min(15, Math.max(0, ((inp.volZ - 0.5) / 2.5) * 15)) : 0;
 
   // 5. Мультибиржевой блок (max 20)
+  // Спред засчитывается по исполнимой части: минус проскальзывание обеих ног
+  // и с поправкой на размер, который стакан вообще тянет. Без данных стакана —
+  // как раньше, по топу книги.
   let multi = 0;
-  if (inp.netSpreadPct != null) multi += Math.min(10, (inp.netSpreadPct / 0.6) * 10); // 0.6% нетто — максимум
+  const netExec = execSpreadPct(inp.netSpreadPct, inp.slipRoundTripPct);
+  if (netExec != null) multi += Math.min(10, (netExec / 0.6) * 10) * sizeViability(inp.maxPosUsd); // 0.6% нетто — максимум
   if (inp.zScore != null && inp.zScore > 0) multi += Math.min(6, (inp.zScore / 3) * 6);
   multi += Math.min(4, Math.max(0, (inp.coverage - 1) * 1.3)); // 2 биржи=1.3, 4 биржи=3.9
   parts.multi = multi;

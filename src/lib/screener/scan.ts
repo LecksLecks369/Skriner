@@ -10,7 +10,7 @@ import {
   type ScanResponse,
 } from './types';
 import { fetchKlines, fetchTickers, pMap, fetchBingxPremium, fetchBingxOI, fetchBingxTaker, fetchOkxFunding, fetchOkxOI, fetchBitgetOI, fetchSpotPrices, fetchWhaleTrades, fetchOrderbook, fetchTape, fetchOkxLiquidations, fetchLsr, type Book, type SpotMap, type TapeTrade, type WhaleInfo, type LiqInfo, type LsrInfo } from './exchanges';
-import { computeScore, detectSweep, natrPct, volumeZ, cvdProxy, btcCorr } from './score';
+import { computeScore, detectSweep, execSpreadPct, natrPct, volumeZ, cvdProxy, btcCorr } from './score';
 import { amihudPct, algoProxyOf, analyzeBook, analyzeTape, assembleDeep, illiqProxyOf } from './liquidity';
 import { seriesStore, appendJournal, journalSummary, appendSnapshot, symbolReputation, warmupSeries, scheduleSeriesPersist } from './store';
 import { appendPattern, resolvePending } from './patterns';
@@ -480,6 +480,7 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
       crossSpreadPct,
       refSpreadPct,
       netSpreadPct,
+      netExecPct: null, // заполняется после deep-блока, когда известен стакан обеих ног
       zScore,
       spreadAgeMin: age != null ? Math.round(age) : null,
       score: sc.score,
@@ -649,6 +650,28 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
         crossSpreadPct: r.crossSpreadPct,
         turnoverUsd: r.turnoverUsd,
       });
+
+      /* Пересчёт скора по стакану: до этого момента мультибиржевой блок считал спред
+         по топу книги, как будто он исполним любым размером. Теперь у монеты есть
+         реальные слипейдж и max-позиция — спред засчитывается по исполнимой части. */
+      r.netExecPct = execSpreadPct(r.netSpreadPct, r.deep.slipRoundTripPct);
+      if (r.deep.slipRoundTripPct != null || r.deep.maxPosUsd != null) {
+        const sc2 = computeScore({
+          natrPct: r.natrPctMax,
+          dOiPct15m: r.dOiPct15m,
+          dOiPct1h: r.dOiPct1h,
+          sweep: r.sweepFresh,
+          volZ: r.volZMax,
+          netSpreadPct: r.netSpreadPct,
+          zScore: r.zScore,
+          coverage: r.coverage,
+          fundingAbs: r.fundingAbs,
+          slipRoundTripPct: r.deep.slipRoundTripPct,
+          maxPosUsd: r.deep.maxPosUsd,
+        });
+        r.score = sc2.score;
+        r.scoreParts = sc2.parts;
+      }
       // история паттернов: «робот вошёл в неликвид» (исход — ход в сторону агрессии)
       if (r.deep.pattern?.robotIlliquid) {
         const bestP = [...a.per.entries()].sort((x, y) => y[1].turnover - x[1].turnover)[0];

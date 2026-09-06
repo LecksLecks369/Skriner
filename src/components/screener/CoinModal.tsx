@@ -180,6 +180,9 @@ function PaperSection({ row }: { row: CoinRow }) {
           pSell: row.bestBid.price,
           netEntry: row.netSpreadPct,
           score: row.score,
+          // глубина стакана на момент входа: без неё P&L симулятора завышен
+          slipRoundTripPct: row.deep?.slipRoundTripPct ?? undefined,
+          sizeUsd: row.deep?.maxPosUsd ?? undefined,
         }),
       });
       load();

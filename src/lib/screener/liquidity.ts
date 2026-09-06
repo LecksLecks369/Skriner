@@ -296,6 +296,14 @@ export function assembleDeep(inp: DeepInput): LiquidityDeep {
     if (maxPos == null || d.maxPosUsd < maxPos) maxPos = d.maxPosUsd;
     if (depth25 == null || d.depth25Usd < depth25) depth25 = d.depth25Usd;
   }
+  /* Стоимость круга по стакану: покупка на entryEx + продажа на exitEx.
+     ExDepth.slip25kPct — худшая сторона своей биржи, поэтому сумма двух ног
+     даёт консервативную (не заниженную) оценку. Если стакана одной из ног нет,
+     возвращаем null: половина круга занизила бы издержки. */
+  const slipEntry = inp.entryEx ? inp.depths[inp.entryEx]?.slip25kPct ?? null : null;
+  const slipExit = inp.exitEx ? inp.depths[inp.exitEx]?.slip25kPct ?? null : null;
+  const slipRoundTrip =
+    slipEntry != null && slipExit != null ? Math.round((slipEntry + slipExit) * 1000) / 1000 : null;
   const algo = algoScoreOf({ tape: inp.tape, volZ: inp.volZ, dOiPct15m: inp.dOiPct15m, sweepAgeMin: inp.sweepAgeMin });
   const illiq = illiqScoreOf(depth25, slip25k, inp.amihud, inp.turnoverUsd);
   const pattern = buildPattern(algo, illiq, inp.netSpreadPct, inp.crossSpreadPct, inp.tape, depth25, slip25k, inp.dOiPct15m);
@@ -305,6 +313,7 @@ export function assembleDeep(inp: DeepInput): LiquidityDeep {
     entryEx: inp.entryEx,
     exitEx: inp.exitEx,
     slip25kPct: slip25k,
+    slipRoundTripPct: slipRoundTrip,
     maxPosUsd: maxPos,
     tape: inp.tape,
     tapeEx: inp.tapeEx,
