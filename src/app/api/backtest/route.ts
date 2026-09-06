@@ -31,6 +31,7 @@ export async function GET(req: NextRequest) {
   const signals: BtSignal[] = [];
 
   for (const line of lines) {
+    if (!Array.isArray(line?.pts)) continue; // битая строка снапшота не должна ронять роут
     const bySymbol = new Map<string, { pBuy: number; pSell: number }>();
     for (const p of line.pts) bySymbol.set(p.s, { pBuy: p.pBuy, pSell: p.pSell });
 

@@ -10,11 +10,17 @@ export async function GET() {
   } catch {
     /* оценка не должна ломать выдачу */
   }
-  const { stats, anyWaiting } = patternStats();
-  return NextResponse.json({
-    stats,
-    anyWaiting,
-    signals: recentPatterns(120),
-  });
+  try {
+    const { stats, anyWaiting } = patternStats();
+    return NextResponse.json({
+      stats,
+      anyWaiting,
+      signals: recentPatterns(120),
+    });
+  } catch (e) {
+    // история паттернов читается из jsonl/json на диске
+    console.error('[patterns] failed:', e);
+    return NextResponse.json({ error: e instanceof Error ? e.message : 'patterns failed' }, { status: 500 });
+  }
 }
 

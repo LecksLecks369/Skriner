@@ -117,7 +117,7 @@ async function getKlines(ex: ExchangeId, native: string): Promise<KlinesResult |
 async function getOiHistoryDelta(native: string): Promise<{ d15: number | null; d1h: number | null }> {
   const hit = cache.oiHistory.get(native);
   if (hit && Date.now() - hit.ts < OI_HISTORY_TTL) return { d15: hit.d15, d1h: hit.d1h };
-  const out = { d15: null, d1h: null };
+  const out: { d15: number | null; d1h: number | null } = { d15: null, d1h: null };
   try {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), 8000);
@@ -212,7 +212,13 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
     .slice(0, top);
 
   // 3. Клайны + BingX extras
-  type Extra = { funding?: number | null; oi?: number | null; taker?: number | null; nextTs?: number | null };
+  type Extra = {
+    funding?: number | null;
+    oi?: number | null;
+    taker?: number | null;
+    nextTs?: number | null;
+    oiDelta?: { d15: number | null; d1h: number | null };
+  };
   const klinesBy = new Map<string, Map<ExchangeId, KlinesResult>>();
   const extras = new Map<string, Map<ExchangeId, Extra>>();
 
@@ -644,7 +650,7 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
         turnoverUsd: r.turnoverUsd,
       });
       // история паттернов: «робот вошёл в неликвид» (исход — ход в сторону агрессии)
-      if (r.deep.pattern.robotIlliquid) {
+      if (r.deep.pattern?.robotIlliquid) {
         const bestP = [...a.per.entries()].sort((x, y) => y[1].turnover - x[1].turnover)[0];
         appendPattern({
           ts: now,
@@ -658,7 +664,7 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
           score: r.score,
           algoScore: r.deep.algoScore,
           illiqScore: r.deep.illiqScore,
-          aggression: r.deep.tape?.aggression ?? null,
+          aggression: r.deep.tape?.aggression ?? undefined,
         });
       }
     },

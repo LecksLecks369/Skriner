@@ -42,16 +42,32 @@ function canon(name: string): string {
   return name.slice(0, 12);
 }
 
+const NOT_FOUND_NOTE = 'сети недоступны с этих бирж — проверьте вручную';
+const TTL_MS = 3600_000;
+const TTL_EMPTY_MS = 10 * 60_000; // «монеты нет» держим меньше: её могут листнуть позже
+
 export async function fetchJsonLike(base: string): Promise<{ networks: NetworkInfo[]; matched: boolean; note?: string }> {
   const hit = cache.get(base);
-  if (hit && Date.now() - hit.ts < 3600_000) return { networks: hit.nets, matched: true };
+  if (hit && Date.now() - hit.ts < (hit.nets.length ? TTL_MS : TTL_EMPTY_MS)) {
+    return hit.nets.length
+      ? { networks: hit.nets, matched: true }
+      : { networks: [], matched: false, note: NOT_FOUND_NOTE };
+  }
 
   const nets: NetworkInfo[] = [];
 
-  // OKX: /api/v5/public/currencies?ccy=BTC
-  const okx = await jget<{ code: string; data?: Array<{ chains?: Array<{ chain?: string; canDep?: boolean; canWd?: boolean; ccY?: string }> }> }>(
-    `https://www.okx.com/api/v5/public/currencies?ccy=${base}`
-  );
+  // обе биржи опрашиваем параллельно: последовательно это удваивало задержку модалки
+  const [okx, bg] = await Promise.all([
+    // OKX: /api/v5/public/currencies?ccy=BTC
+    jget<{ code: string; data?: Array<{ chains?: Array<{ chain?: string; canDep?: boolean; canWd?: boolean; ccY?: string }> }> }>(
+      `https://www.okx.com/api/v5/public/currencies?ccy=${base}`
+    ),
+    // Bitget: /api/v2/spot/public/coins (все монеты одним запросом)
+    jget<{ code: string; data?: Array<{ coin?: string; chains?: Array<{ chain?: string; withdrawable?: string | boolean; rechargeable?: string | boolean }> }> }>(
+      'https://api.bitget.com/api/v2/spot/public/coins'
+    ),
+  ]);
+
   const okxChains = okx?.data?.[0]?.chains || [];
   for (const ch of okxChains) {
     if (!ch.chain) continue;
@@ -64,10 +80,6 @@ export async function fetchJsonLike(base: string): Promise<{ networks: NetworkIn
     });
   }
 
-  // Bitget: /api/v2/spot/public/coins (все монеты одним запросом, кэшируем отдельно)
-  const bg = await jget<{ code: string; data?: Array<{ coin?: string; chains?: Array<{ chain?: string; withdrawable?: string | boolean; rechargeable?: string | boolean }> }> }>(
-    'https://api.bitget.com/api/v2/spot/public/coins'
-  );
   const bgCoin = bg?.data?.find((c) => c.coin?.toUpperCase() === base);
   for (const ch of bgCoin?.chains || []) {
     if (!ch.chain) continue;
@@ -80,8 +92,6 @@ export async function fetchJsonLike(base: string): Promise<{ networks: NetworkIn
     });
   }
 
-  if (nets.length) cache.set(base, { ts: Date.now(), nets });
-
   // дедуп по имени сети
   const seen = new Map<string, NetworkInfo>();
   for (const n of nets) {
@@ -93,10 +103,16 @@ export async function fetchJsonLike(base: string): Promise<{ networks: NetworkIn
     }
   }
   const uniq = [...seen.values()];
+
+  // кэшируем именно дедуплицированный результат: раньше в кэш клался сырой массив,
+  // и все повторные вызовы в течение часа отдавали дубли сетей без объединения флагов.
+  // Пустой ответ кладём в кэш только если обе биржи реально ответили — иначе это сетевой сбой.
+  if (uniq.length || (okx != null && bg != null)) cache.set(base, { ts: Date.now(), nets: uniq });
+
   return {
     networks: uniq,
     matched: uniq.length > 0,
-    note: uniq.length ? undefined : 'сети недоступны с этих бирж — проверьте вручную',
+    note: uniq.length ? undefined : NOT_FOUND_NOTE,
   };
 }
 

@@ -9,7 +9,12 @@ export async function GET(req: NextRequest) {
   if (!/^[A-Z0-9]+$/.test(symbol)) {
     return NextResponse.json({ error: 'bad symbol' }, { status: 400 });
   }
-  const hist = seriesStore.getSpreadHistory(symbol);
-  return NextResponse.json({ symbol, points: hist.slice(-240) });
+  try {
+    const hist = seriesStore.getSpreadHistory(symbol);
+    return NextResponse.json({ symbol, points: hist.slice(-240) });
+  } catch (e) {
+    console.error('[spread-history] failed:', symbol, e);
+    return NextResponse.json({ error: e instanceof Error ? e.message : 'history failed' }, { status: 500 });
+  }
 }
 

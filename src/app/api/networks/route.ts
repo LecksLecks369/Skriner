@@ -10,7 +10,12 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: 'bad symbol' }, { status: 400 });
   }
   const base = symbol.replace(/USDT$/, '') || symbol;
-  const data = await fetchJsonLike(base);
-  return NextResponse.json({ symbol: base, ...data });
+  try {
+    const data = await fetchJsonLike(base);
+    return NextResponse.json({ symbol: base, ...data });
+  } catch (e) {
+    console.error('[networks] failed:', base, e);
+    return NextResponse.json({ error: e instanceof Error ? e.message : 'networks failed' }, { status: 500 });
+  }
 }
 

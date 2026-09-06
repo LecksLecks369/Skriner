@@ -1,7 +1,8 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import type { CoinRow, NetworkInfo, PaperTrade } from '@/lib/screener/types';
+import type { CoinRow, PaperTrade } from '@/lib/screener/types';
+import type { NetworkInfo } from '@/lib/screener/networks';
 import { netSpreadForPair } from '@/lib/screener/pair';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';

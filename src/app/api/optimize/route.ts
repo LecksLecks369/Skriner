@@ -72,6 +72,7 @@ function runCombo(
   };
 
   for (const line of lines) {
+    if (!Array.isArray(line?.pts)) continue; // битая строка снапшота не должна ронять прогон
     // 1) закрытие открытых сделок по текущим ценам
     for (const [sym, arr] of open) {
       const cur = line.pts.find((p) => p.s === sym);
