@@ -67,7 +67,8 @@ export interface ExchangeRow {
   price: number; // последняя сделка (для отображения)
   bid: number | null; // лучший bid — по нему продают
   ask: number | null; // лучший ask — по нему покупают
-  fundingRate: number | null;
+  fundingRate: number | null; // ставка как её публикует биржа, за свой период
+  fundingIntervalMin: number | null; // период начисления, минут (240 = 4ч, 480 = 8ч)
   oiUsd: number | null;
   dOiPct5m: number | null;
   dOiPct15m: number | null;
@@ -95,7 +96,8 @@ export interface CoinRow {
   spreadAgeMin: number | null; // сколько минут спред ≥ порога
   score: number; // 0..100
   scoreParts: Record<string, number>;
-  fundingAbs: number | null;
+  fundingAbs: number | null; // максимум |ставки|, приведённой к 8 часам
+  fundingNormalized: boolean; // известен ли период начисления; false = ставка взята как есть
   oiUsdMax: number | null;
   dOiPct15m: number | null;
   dOiPct1h: number | null;
@@ -144,6 +146,7 @@ export interface ExDepth {
   slip25kPct: number | null;
   slip50kPct: number | null;
   maxPosUsd: number; // макс размер с слипейджем ≤0.3% (худшая сторона), USD
+  maxPosTruncated: boolean; // книга кончилась раньше порога: значение — нижняя оценка, не рынок
 }
 
 /* ---------- Неликвид: статистика ленты сделок ---------- */
@@ -169,6 +172,7 @@ export interface LiquidityDeep {
   slipRoundTripPct: number | null; // слипейдж обеих ног круга: вход + выход, %
   slipBudgetUsd: number | null; // на каком объёме измерен slipRoundTripPct ($25k, иначе $10k)
   maxPosUsd: number | null; // минимальный безопасный размер среди entry/exit
+  maxPosTruncated: boolean; // хотя бы одна книга кончилась раньше порога — значение занижено
   tape: TapeStats | null;
   tapeEx: ExchangeId | null;
   amihudPct: number | null; // % движения цены на $1M рыночного ордера (по 1м свечам)

@@ -36,8 +36,18 @@ export function slipForUsd(levels: { p: number; s: number }[], mid: number, budg
   return (Math.abs(avg - mid) / mid) * 100;
 }
 
-/** Максимальный размер ордера (USD) с слипейджем ≤ maxSlipPct по одной стороне */
-export function maxSizeForSlip(levels: { p: number; s: number }[], mid: number, maxSlipPct = MAX_SLIP_PCT): number {
+/**
+ * Максимальный размер ордера (USD) с слипейджем ≤ maxSlipPct по одной стороне.
+ * `truncated` = уровни книги кончились раньше, чем слипейдж дошёл до порога:
+ * тогда это нижняя оценка, ограниченная глубиной запроса, а не рынком. Биржи
+ * отдают разное число уровней (Bitget не больше 100), поэтому без этого флага
+ * max-позиции с разных площадок несопоставимы.
+ */
+export function maxSizeForSlip(
+  levels: { p: number; s: number }[],
+  mid: number,
+  maxSlipPct = MAX_SLIP_PCT
+): { usd: number; truncated: boolean } {
   let filled = 0;
   let qty = 0;
   for (const l of levels) {
@@ -46,9 +56,9 @@ export function maxSizeForSlip(levels: { p: number; s: number }[], mid: number, 
     filled += lvlUsd;
     qty += lvlUsd / l.p;
     const avg = filled / qty;
-    if ((Math.abs(avg - mid) / mid) * 100 > maxSlipPct) return Math.max(0, prevFilled);
+    if ((Math.abs(avg - mid) / mid) * 100 > maxSlipPct) return { usd: Math.max(0, prevFilled), truncated: false };
   }
-  return filled;
+  return { usd: filled, truncated: true };
 }
 
 export function analyzeBook(book: Book): ExDepth | null {
@@ -63,6 +73,8 @@ export function analyzeBook(book: Book): ExDepth | null {
     return Math.max(a, b);
   };
   const slip = (budget: number) => worst(slipForUsd(book.asks, mid, budget), slipForUsd(book.bids, mid, budget));
+  const maxAsk = maxSizeForSlip(book.asks, mid);
+  const maxBid = maxSizeForSlip(book.bids, mid);
   return {
     depth10Usd: depthWithin(book.asks, mid, 0.001, 'ask') + depthWithin(book.bids, mid, 0.001, 'bid'),
     depth25Usd: depthWithin(book.asks, mid, 0.0025, 'ask') + depthWithin(book.bids, mid, 0.0025, 'bid'),
@@ -71,7 +83,9 @@ export function analyzeBook(book: Book): ExDepth | null {
     slip10kPct: slip(10_000),
     slip25kPct: slip(25_000),
     slip50kPct: slip(50_000),
-    maxPosUsd: Math.min(maxSizeForSlip(book.asks, mid), maxSizeForSlip(book.bids, mid)),
+    maxPosUsd: Math.min(maxAsk.usd, maxBid.usd),
+    // усечение хотя бы одной стороны делает max-позицию нижней оценкой
+    maxPosTruncated: maxAsk.truncated || maxBid.truncated,
   };
 }
 
@@ -290,11 +304,13 @@ export function assembleDeep(inp: DeepInput): LiquidityDeep {
   let slip25k: number | null = null;
   let maxPos: number | null = null;
   let depth25: number | null = null;
+  let maxPosTruncated = false;
   for (const ex of rel) {
     const d = inp.depths[ex]!;
     if (d.slip25kPct != null && (slip25k == null || d.slip25kPct > slip25k)) slip25k = d.slip25kPct;
     if (maxPos == null || d.maxPosUsd < maxPos) maxPos = d.maxPosUsd;
     if (depth25 == null || d.depth25Usd < depth25) depth25 = d.depth25Usd;
+    if (d.maxPosTruncated) maxPosTruncated = true;
   }
   /* Стоимость круга по стакану: покупка на entryEx + продажа на exitEx.
      ExDepth.slipNkPct — худшая сторона своей биржи, поэтому сумма двух ног
@@ -332,6 +348,7 @@ export function assembleDeep(inp: DeepInput): LiquidityDeep {
     slipRoundTripPct: slipRoundTrip,
     slipBudgetUsd,
     maxPosUsd: maxPos,
+    maxPosTruncated,
     tape: inp.tape,
     tapeEx: inp.tapeEx,
     amihudPct: inp.amihud,

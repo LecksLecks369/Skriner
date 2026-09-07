@@ -19,6 +19,11 @@ async function fetchJson<T>(url: string, timeoutMs = 9000): Promise<T> {
   }
 }
 
+/* Единая глубина стакана для всех бирж: измеренная max-позиция сравнима между
+   площадками, только если у всех запрошено одинаковое число уровней. Bitget
+   отдаёт максимум 100 независимо от limit — такие книги помечаются как усечённые. */
+export const BOOK_LEVELS = 200;
+
 /** Число из поля тикера; null, если поля нет или оно не положительное */
 function numOrNull(v: unknown): number | null {
   const n = typeof v === 'number' ? v : parseFloat(String(v ?? ''));
@@ -395,22 +400,35 @@ async function fetchOurbit(): Promise<ExchangeFetchResult> {
 /* ---------------- Публичное API ---------------- */
 export async function fetchTickers(ex: ExchangeId): Promise<ExchangeFetchResult> {
   try {
+    let res: ExchangeFetchResult;
     switch (ex) {
       case 'bybit':
-        return await fetchBybit();
+        res = await fetchBybit();
+        break;
       case 'bingx':
-        return await fetchBingx();
+        res = await fetchBingx();
+        break;
       case 'okx':
-        return await fetchOkx();
+        res = await fetchOkx();
+        break;
       case 'bitget':
-        return await fetchBitget();
+        res = await fetchBitget();
+        break;
       case 'mexc':
-        return await fetchMexc();
+        res = await fetchMexc();
+        break;
       case 'ourbit':
-        return await fetchOurbit();
+        res = await fetchOurbit();
+        break;
       default:
         throw new Error('unknown exchange');
     }
+    // ответ разобрался, но не дал ни одного символа — это отказ, а не успех:
+    // с ok:true и symbols:0 биржа выглядела рабочей и молча выпадала из сравнения
+    if (res.ok && res.tickers.length === 0) {
+      return { ...res, ok: false, error: res.error ?? 'ответ без символов' };
+    }
+    return res;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     const friendly =
@@ -584,11 +602,66 @@ export interface Book {
   asks: BookLevel[]; // по возрастанию цены
 }
 
+/* ---------------- ИНТЕРВАЛЫ ФАНДИНГА ----------------
+   Ставки фандинга нельзя сравнивать напрямую: часть символов рассчитывается
+   раз в 4 часа, часть — раз в 8. Ставка 0.01% за 4ч вдвое «дороже» такой же
+   ставки за 8ч, поэтому без нормировки и порог скоринга, и разброс между
+   биржами смешивают разные величины. Интервалы меняются редко — кешируем надолго. */
+
+export interface FundingIntervals {
+  bybit: Map<string, number>; // нормализованный символ -> минуты
+  bitget: Map<string, number>;
+}
+
+/** Интервалы начисления фандинга (в минутах) там, где биржа их публикует */
+export async function fetchFundingIntervals(): Promise<FundingIntervals> {
+  const bybit = new Map<string, number>();
+  const bitget = new Map<string, number>();
+  await Promise.all([
+    (async () => {
+      try {
+        const j = await fetchJson<{ retCode: number; result?: { list?: Array<Record<string, string>> } }>(
+          'https://api.bybit.com/v5/market/instruments-info?category=linear&limit=1000'
+        );
+        for (const t of j.result?.list || []) {
+          const min = Number(t.fundingInterval);
+          if (t.symbol && isFinite(min) && min > 0) bybit.set(normalizeSymbol('bybit', t.symbol), min);
+        }
+      } catch (e) {
+        // без интервалов работаем как раньше, но молчать нельзя: тихий сбой здесь
+        // означает, что 4ч-ставки снова сравниваются с 8ч как равные
+        console.error('[funding-interval] bybit:', e instanceof Error ? e.message : e);
+      }
+    })(),
+    (async () => {
+      try {
+        const j = await fetchJson<{ code: string; data?: Array<Record<string, string>> }>(
+          'https://api.bitget.com/api/v2/mix/market/contracts?productType=USDT-FUTURES'
+        );
+        for (const t of j.data || []) {
+          const hours = Number(t.fundInterval);
+          if (t.symbol && isFinite(hours) && hours > 0) bitget.set(normalizeSymbol('bitget', t.symbol), hours * 60);
+        }
+      } catch (e) {
+        console.error('[funding-interval] bitget:', e instanceof Error ? e.message : e);
+      }
+    })(),
+  ]);
+  return { bybit, bitget };
+}
+
+/** Ставка, приведённая к 8-часовому периоду — только такие можно сравнивать и складывать */
+export function normalizeFunding(rate: number | null, intervalMin: number | null): number | null {
+  if (rate == null) return null;
+  if (intervalMin == null || intervalMin <= 0) return rate; // интервал неизвестен — оставляем как есть
+  return rate * (480 / intervalMin);
+}
+
 export async function fetchOrderbook(ex: ExchangeId, native: string): Promise<Book | null> {
   try {
     if (ex === 'bybit') {
       const j = await fetchJson<{ retCode: number; result?: { b?: string[][]; a?: string[][] } }>(
-        `https://api.bybit.com/v5/market/orderbook?category=linear&symbol=${native}&limit=200`, 7000);
+        `https://api.bybit.com/v5/market/orderbook?category=linear&symbol=${native}&limit=${BOOK_LEVELS}`, 7000);
       if (j.retCode !== 0 || !j.result) return null;
       const lv = (arr?: string[][]): BookLevel[] =>
         (arr || []).map((r) => ({ p: parseFloat(r[0]), s: parseFloat(r[1]) })).filter((l) => l.p > 0 && l.s > 0);
@@ -596,7 +669,7 @@ export async function fetchOrderbook(ex: ExchangeId, native: string): Promise<Bo
     }
     if (ex === 'bingx') {
       const j = await fetchJson<{ code: number; data?: { bids?: string[][]; asks?: string[][] } }>(
-        `https://open-api.bingx.com/openApi/swap/v2/quote/depth?symbol=${native}&limit=50`, 7000);
+        `https://open-api.bingx.com/openApi/swap/v2/quote/depth?symbol=${native}&limit=${BOOK_LEVELS}`, 7000);
       if (j.code !== 0 || !j.data) return null;
       const lv = (arr?: string[][]): BookLevel[] =>
         (arr || []).map((r) => ({ p: parseFloat(r[0]), s: parseFloat(r[1]) })).filter((l) => l.p > 0 && l.s > 0);
@@ -604,7 +677,7 @@ export async function fetchOrderbook(ex: ExchangeId, native: string): Promise<Bo
     }
     if (ex === 'okx') {
       const j = await fetchJson<{ code: string; data?: Array<{ bids?: string[][]; asks?: string[][] }> }>(
-        `https://www.okx.com/api/v5/market/books?instId=${native}&sz=100`, 7000);
+        `https://www.okx.com/api/v5/market/books?instId=${native}&sz=${BOOK_LEVELS}`, 7000);
       if (j.code !== '0' || !j.data?.[0]) return null;
       const lv = (arr?: string[][]): BookLevel[] =>
         (arr || []).map((r) => ({ p: parseFloat(r[0]), s: parseFloat(r[1]) })).filter((l) => l.p > 0 && l.s > 0);

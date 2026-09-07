@@ -9,7 +9,7 @@ import {
   type KlinesResult,
   type ScanResponse,
 } from './types';
-import { fetchKlines, fetchTickers, pMap, fetchBingxPremium, fetchBingxOI, fetchBingxTaker, fetchOkxFunding, fetchOkxOI, fetchBitgetOI, fetchSpotPrices, fetchWhaleTrades, fetchOrderbook, fetchTape, fetchOkxLiquidations, fetchLsr, type Book, type SpotMap, type TapeTrade, type WhaleInfo, type LiqInfo, type LsrInfo } from './exchanges';
+import { fetchKlines, fetchTickers, pMap, fetchBingxPremium, fetchBingxOI, fetchBingxTaker, fetchOkxFunding, fetchOkxOI, fetchBitgetOI, fetchSpotPrices, fetchWhaleTrades, fetchOrderbook, fetchTape, fetchOkxLiquidations, fetchLsr, fetchFundingIntervals, normalizeFunding, type Book, type SpotMap, type TapeTrade, type WhaleInfo, type LiqInfo, type LsrInfo, type FundingIntervals } from './exchanges';
 import { computeScore, detectSweep, execSpreadPct, natrPct, volumeZ, cvdProxy, btcCorr } from './score';
 import { amihudPct, algoProxyOf, analyzeBook, analyzeTape, assembleDeep, illiqProxyOf } from './liquidity';
 import { seriesStore, appendJournal, journalSummary, appendSnapshot, symbolReputation, warmupSeries, scheduleSeriesPersist } from './store';
@@ -88,6 +88,21 @@ function mapLimitKey<T>(key: string, map: Map<string, { ts: number; v: T }>, ttl
     console.error('[mapLimitKey]', key, e instanceof Error ? e.message : e);
     return null as unknown as T;
   });
+}
+
+/* Интервалы фандинга меняются редко — держим час, чтобы не дёргать
+   instruments-info на каждом скане. */
+const FUNDING_INTERVALS_TTL = 60 * 60_000;
+let fundingIntervalsCache: { ts: number; v: FundingIntervals } | null = null;
+
+async function getFundingIntervals(): Promise<FundingIntervals> {
+  if (fundingIntervalsCache && Date.now() - fundingIntervalsCache.ts < FUNDING_INTERVALS_TTL) {
+    return fundingIntervalsCache.v;
+  }
+  const v = await fetchFundingIntervals();
+  // пустой ответ не кешируем на час: биржа могла просто не ответить
+  if (v.bybit.size || v.bitget.size) fundingIntervalsCache = { ts: Date.now(), v };
+  return v;
 }
 
 async function getTickers(): Promise<Partial<Record<ExchangeId, ExchangeFetchResult>>> {
@@ -176,7 +191,7 @@ async function getWhale(native: string): Promise<WhaleInfo | null> {
 async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promise<ScanResponse> {
   warmupSeries(); // прогрев: восстановить серии с диска до первых записей
   const now = Date.now();
-  const tickers = await getTickers();
+  const [tickers, fundingIntervals] = await Promise.all([getTickers(), getFundingIntervals()]);
   const okExchanges = EXCHANGES.filter((e) => tickers[e.id]?.ok);
 
   // 1. Объединение тикеров по нормализованному символу
@@ -395,6 +410,7 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
         bid: p.bid,
         ask: p.ask,
         fundingRate: p.funding ?? ext?.funding ?? null,
+        fundingIntervalMin: fundingIntervals[exId as 'bybit' | 'bitget']?.get(a.symbol) ?? null,
         oiUsd: p.oiUsd ?? (p.oi != null ? p.oi * p.price : ext?.oi != null ? ext.oi * p.price : null),
         dOiPct5m: null,
         dOiPct15m: d15,
@@ -406,8 +422,14 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
       });
     }
 
-    const fundingVals = exRows.map((r) => r.fundingRate).filter((v): v is number => v != null);
+    /* Фандинг сравниваем только приведённым к 8 часам: часть символов считается
+       раз в 4ч, и без нормировки один порог скоринга смешивает разные величины. */
+    const fundingVals = exRows
+      .map((r) => normalizeFunding(r.fundingRate, r.fundingIntervalMin))
+      .filter((v): v is number => v != null);
     const fundingAbs = fundingVals.length ? Math.max(...fundingVals.map(Math.abs)) : null;
+    // известен ли интервал хотя бы у одной ноги: если нет — ставка взята как есть
+    const fundingNormalized = exRows.some((r) => r.fundingRate != null && r.fundingIntervalMin != null);
     const oiUsdVals = exRows.map((r) => r.oiUsd).filter((v): v is number => v != null);
     const oiUsdMax = oiUsdVals.length ? Math.max(...oiUsdVals) : null;
     const cvd = exRows.find((r) => r.cvdTaker != null)?.cvdTaker ?? null;
@@ -424,8 +446,10 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
         spotBasis = { ex: exId, perp: p.price, spot: sp, pct };
       }
     }
-    // разброс фандинга между биржами
-    const fundRatesAll = exRows.map((r) => r.fundingRate).filter((v): v is number => v != null);
+    // разброс фандинга между биржами — тоже по 8-часовым эквивалентам
+    const fundRatesAll = exRows
+      .map((r) => normalizeFunding(r.fundingRate, r.fundingIntervalMin))
+      .filter((v): v is number => v != null);
     const fundingSpreadPct = fundRatesAll.length >= 2 ? (Math.max(...fundRatesAll) - Math.min(...fundRatesAll)) * 100 : null;
     // ближайший следующий фандинг
     let fundingNextTs = 0;
@@ -497,6 +521,7 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
       netSpreadPct,
       netExecPct: null, // заполняется после deep-блока, когда известен стакан обеих ног
       quoteBased,
+      fundingNormalized,
       zScore,
       spreadAgeMin: age != null ? Math.round(age) : null,
       score: sc.score,
