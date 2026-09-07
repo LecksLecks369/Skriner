@@ -21,6 +21,10 @@ interface PatternStat {
   avgMfeWin: number | null;
   avgMfeLoss: number | null;
   lastTs: number | null;
+  expectancyPct: number | null;
+  sumPnlPct: number | null;
+  byExit: { tp: number; sl: number; timeout: number };
+  avgMaeWin: number | null;
 }
 
 interface PatternSig {
@@ -140,10 +144,22 @@ export function PatternHistory() {
                 {st.waiting > 0 && <span className="text-zinc-400">ждут: {st.waiting}</span>}
                 {st.expired > 0 && <span>истекло: {st.expired}</span>}
               </div>
-              {(st.avgMfeWin != null || st.avgMfeLoss != null) && (
+              {st.expectancyPct != null && (
+                <div className="mt-1.5 flex flex-wrap items-baseline gap-x-2 text-[10px] tabular-nums">
+                  <span className="text-zinc-500">на сделку:</span>
+                  <span className={st.expectancyPct > 0 ? 'font-medium text-emerald-400' : 'font-medium text-rose-400'}>
+                    {st.expectancyPct > 0 ? '+' : ''}
+                    {st.expectancyPct.toFixed(3)}%
+                  </span>
+                  <span className="text-zinc-600">
+                    тейк {st.byExit.tp} / стоп {st.byExit.sl} / время {st.byExit.timeout}
+                  </span>
+                </div>
+              )}
+              {(st.avgMfeWin != null || st.avgMaeWin != null) && (
                 <div className="mt-1 flex gap-2 text-[10px] tabular-nums">
-                  {st.avgMfeWin != null && <span className="text-emerald-500/80">макс. ход в плюс: +{st.avgMfeWin.toFixed(2)}%</span>}
-                  {st.avgMfeLoss != null && <span className="text-rose-500/70">у мимо: +{st.avgMfeLoss.toFixed(2)}%</span>}
+                  {st.avgMfeWin != null && <span className="text-emerald-500/80">ход в плюс: +{st.avgMfeWin.toFixed(2)}%</span>}
+                  {st.avgMaeWin != null && <span className="text-zinc-500">пересидели: −{st.avgMaeWin.toFixed(2)}%</span>}
                 </div>
               )}
               <div className="mt-1.5 border-t border-zinc-800/80 pt-1.5 text-[10px] leading-snug text-zinc-600">{st.hint}</div>
@@ -154,7 +170,8 @@ export function PatternHistory() {
 
       <p className="max-w-3xl text-[11px] leading-relaxed text-zinc-600">
         Каждый тип сигнала оценивается автоматически через 30 минут после срабатывания: направленные паттерны
-        (робот, свип, киты, фандинг) — по максимальному ходу цены в сторону сигнала; спред — по схлопыванию
+        (робот, свип, киты, фандинг) — симуляцией сделки с тейком и стопом 1:1, засчитывается то, что цена
+        задела первой (в пределах одной минутной свечи приоритет у стопа); спред — по схлопыванию
         разрыва вдвое. Оценка живёт на сервере и переживает перезапуск: серии в памяти до ~9 часов, затем
         докупаются минутные клайны биржи сигнала. Сигналы старше 6 часов без данных помечаются «истёк» и в
         win-rate не попадают. Статистика честно копится с нуля — чем дольше работает скринер, тем надёжнее цифры.
