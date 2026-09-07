@@ -312,30 +312,55 @@ export async function fetchBitgetOI(native: string): Promise<number | null> {
 /* ---------------- MEXC (graceful) ---------------- */
 const MEXC_BASE = 'https://contract.mexc.com/api/v1/contract';
 
+/* Размер контракта по native-символу, заполняется на каждом fetchMexc.
+   Нужен и стакану: MEXC отдаёт объёмы уровней в контрактах, а не в монетах —
+   без пересчёта книга выглядит в тысячи раз глубже, чем есть, и слипейдж
+   получается нулевым ровно там, где он максимальный. */
+const mexcContractSize = new Map<string, number>();
+
+/* /contract/detail — это справочник контрактов: там нет ни цены, ни объёма, ни фандинга.
+   Котировки живут в /contract/ticker. Раньше цена бралась из detail, выходила undefined,
+   и биржа стабильно отдавала ноль тикеров («ответ без символов») — MEXC молча выпадал
+   из сравнения. Detail всё ещё нужен, но только за contractSize и статусом листинга:
+   holdVol и volume24 в ticker считаются в контрактах, а не в монетах. */
 async function fetchMexc(): Promise<ExchangeFetchResult> {
   const t0 = Date.now();
-  const j = await fetchJson<{ success: boolean; data?: Array<Record<string, unknown>> }>(
-    `${MEXC_BASE}/detail`
-  );
-  if (!j.success || !j.data) throw new Error('mexc success!=false');
+  const [tick, det] = await Promise.all([
+    fetchJson<{ success: boolean; data?: Array<Record<string, unknown>> }>(`${MEXC_BASE}/ticker`),
+    fetchJson<{ success: boolean; data?: Array<Record<string, unknown>> }>(`${MEXC_BASE}/detail`).catch(() => null),
+  ]);
+  if (!tick.success || !Array.isArray(tick.data)) throw new Error('mexc ticker success!=true');
+
+  const meta = new Map<string, { size: number; active: boolean }>();
+  for (const d of det?.data || []) {
+    const sym = String(d.symbol || '');
+    if (!sym) continue;
+    const size = Number(d.contractSize);
+    const ok = isFinite(size) && size > 0;
+    meta.set(sym, { size: ok ? size : 1, active: Number(d.state) === 0 });
+    if (ok) mexcContractSize.set(sym, size);
+  }
+
   const tickers: RawTicker[] = [];
-  for (const t of j.data) {
+  for (const t of tick.data) {
     const symbol = String(t.symbol || '');
     if (!symbol.endsWith('_USDT')) continue;
-    if (Number(t.state) !== 0) continue; // 0 = active
+    const m = meta.get(symbol);
+    if (m && !m.active) continue; // 0 = active; без detail статус неизвестен — не отбрасываем
     const price = Number(t.lastPrice);
-    const turnover = Number(t.turnover24h || 0);
     if (!price || price <= 0) continue;
+    const holdVol = Number(t.holdVol);
+    const oi = isFinite(holdVol) && holdVol > 0 ? holdVol * (m?.size ?? 1) : null;
     tickers.push({
       symbol: normalizeSymbol('mexc', symbol),
       nativeSymbol: symbol,
       price,
       bid: numOrNull(t.bid1),
       ask: numOrNull(t.ask1),
-      turnoverUsd: turnover,
+      turnoverUsd: Number(t.amount24 || 0), // amount24 уже в USDT, volume24 — в контрактах
       fundingRate: t.fundingRate != null ? Number(t.fundingRate) : null,
-      oi: t.holdVol != null ? Number(t.holdVol) : null,
-      oiUsd: null,
+      oi,
+      oiUsd: oi != null ? oi * price : null,
     });
   }
   return { exchange: 'mexc', ok: true, tickers, fetchedAt: Date.now(), lagMs: Date.now() - t0 };
@@ -689,6 +714,25 @@ export async function fetchOrderbook(ex: ExchangeId, native: string): Promise<Bo
       if (j.code !== '00000' || !j.data) return null;
       const lv = (arr?: Array<[number, number]>): BookLevel[] =>
         (arr || []).map((r) => ({ p: Number(r[0]), s: Number(r[1]) })).filter((l) => l.p > 0 && l.s > 0);
+      return { bids: lv(j.data.bids), asks: lv(j.data.asks) };
+    }
+    if (ex === 'mexc') {
+      /* Пока MEXC отдавал ноль тикеров, книга была не нужна. Теперь он снова участвует
+         в спредах и регулярно оказывается одной из ног — без его стакана слипейдж
+         пары не считается вовсе, и такая монета молча выпадает из симулятора. */
+      const size = mexcContractSize.get(native);
+      // без размера контракта уровни не перевести в монеты; выдумывать 1 нельзя —
+      // книга оказалась бы завышенной, а слипейдж занижен ровно там, где он важен
+      if (!size) return null;
+      const j = await fetchJson<{
+        success: boolean;
+        data?: { bids?: Array<[number, number, number]>; asks?: Array<[number, number, number]> };
+      }>(`${MEXC_BASE}/depth/${native}?limit=${BOOK_LEVELS}`, 7000);
+      if (!j.success || !j.data) return null;
+      const lv = (arr?: Array<[number, number, number]>): BookLevel[] =>
+        (arr || [])
+          .map((r) => ({ p: Number(r[0]), s: Number(r[1]) * size }))
+          .filter((l) => l.p > 0 && l.s > 0);
       return { bids: lv(j.data.bids), asks: lv(j.data.asks) };
     }
     return null;

@@ -1,43 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
-import fs from 'fs';
-import path from 'path';
 import type { PaperTrade } from '@/lib/screener/types';
+import { closePaperTrade, loadPaper, openPaperTrade, setPaperTrades } from '@/lib/screener/paper';
 
 export const dynamic = 'force-dynamic';
 
-/* Paper-трейдинг: виртуальные спред-сделки. Хранение — data/paper_trades.json (персистентно). */
+/* Paper-трейдинг: виртуальные спред-сделки. Хранилище и правила закрытия — в lib/screener/paper.ts,
+   там же автопилот, который ведёт сделки на сервере. Роут — только HTTP-обёртка над ним:
+   пока склад был локальным для роута, ручные сделки и автопилот писали в разные копии списка. */
 
-const DATA_DIR = path.join(process.cwd(), 'data');
-const FILE = path.join(DATA_DIR, 'paper_trades.json');
-
-interface PaperGlobal {
-  __screenerPaper: { trades: PaperTrade[]; loaded: boolean };
-}
-const g = globalThis as unknown as PaperGlobal;
-if (!g.__screenerPaper) g.__screenerPaper = { trades: [], loaded: false };
-const store = g.__screenerPaper;
-
-function load(): PaperTrade[] {
-  if (store.loaded) return store.trades;
-  store.loaded = true;
-  try {
-    if (fs.existsSync(FILE)) {
-      store.trades = JSON.parse(fs.readFileSync(FILE, 'utf8')) as PaperTrade[];
-    }
-  } catch {
-    store.trades = [];
-  }
-  return store.trades;
-}
-
-function save() {
-  try {
-    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.writeFileSync(FILE, JSON.stringify(store.trades, null, 0));
-  } catch {
-    /* диск недоступен — держим в памяти */
-  }
-}
+const load = loadPaper;
 
 export async function GET() {
   const trades = load().slice().reverse(); // новые сверху
@@ -130,32 +101,17 @@ export async function POST(req: NextRequest) {
     const trades = load();
 
     if (body.action === 'clear') {
-      store.trades = trades.filter((t) => t.status === 'open');
-      save();
+      setPaperTrades(trades.filter((t) => t.status === 'open'));
       return NextResponse.json({ ok: true });
     }
 
     if (body.action === 'close' && body.id) {
-      const tr = trades.find((x) => x.id === body.id && x.status === 'open');
-      if (!tr) return NextResponse.json({ error: 'сделка не найдена' }, { status: 404 });
       // netExit обязателен и должен быть числом: молчаливый 0 записал бы фиктивный «полный выигрыш»
       if (typeof body.netExit !== 'number' || !Number.isFinite(body.netExit)) {
         return NextResponse.json({ error: 'netExit обязателен и должен быть числом' }, { status: 400 });
       }
-      tr.status = 'closed';
-      tr.closedTs = Date.now();
-      tr.netExit = body.netExit;
-      const gross = tr.netEntry - tr.netExit;
-      tr.pnlGrossPct = Number(gross.toFixed(4));
-      /* Симулятор обязан «проедать стакан»: круг пересекает обе книги дважды —
-         на входе (покупка+продажа) и на выходе (обратные ноги). slipRoundTripPct —
-         стоимость одного такого пересечения, поэтому вычитаем её дважды.
-         Если стакана на входе не было (slipModeled=false) — P&L остаётся валовым
-         и завышенным ровно на величину неучтённого проскальзывания. */
-      const slipCost = tr.slipRoundTripPct != null ? tr.slipRoundTripPct * 2 : 0;
-      tr.pnlPct = Number((gross - slipCost).toFixed(4));
-      tr.closeReason = body.reason || 'manual';
-      save();
+      const tr = closePaperTrade(body.id, body.netExit, body.reason || 'manual');
+      if (!tr) return NextResponse.json({ error: 'сделка не найдена' }, { status: 404 });
       return NextResponse.json({ ok: true, trade: tr });
     }
 
@@ -163,30 +119,19 @@ export async function POST(req: NextRequest) {
     if (!body.symbol || !body.buyEx || !body.sellEx || body.pBuy == null || body.pSell == null || body.netEntry == null) {
       return NextResponse.json({ error: 'неполные данные сделки' }, { status: 400 });
     }
-    // глубина стакана на входе: без неё P&L считается по цене спреда, как будто
-    // позиция любого размера исполняется по топу книги
-    const slipRt =
-      typeof body.slipRoundTripPct === 'number' && Number.isFinite(body.slipRoundTripPct) && body.slipRoundTripPct >= 0
-        ? Number(body.slipRoundTripPct.toFixed(4))
-        : null;
-    const trade: PaperTrade = {
-      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-      ts: Date.now(),
+    /* глубина стакана на входе передаётся вызывающим: без неё P&L считается по цене
+       спреда, как будто позиция любого размера исполняется по топу книги */
+    const trade = openPaperTrade({
       symbol: body.symbol,
       buyEx: body.buyEx,
       sellEx: body.sellEx,
       pBuy: body.pBuy,
       pSell: body.pSell,
-      netEntry: Number(body.netEntry.toFixed(4)),
-      score: body.score ?? 0,
-      status: 'open',
-      sizeUsd: typeof body.sizeUsd === 'number' && Number.isFinite(body.sizeUsd) ? body.sizeUsd : undefined,
-      slipRoundTripPct: slipRt ?? undefined,
-      slipModeled: slipRt != null,
-    };
-    trades.push(trade);
-    if (trades.length > 500) store.trades = trades.slice(-500);
-    save();
+      netEntry: body.netEntry,
+      score: body.score,
+      sizeUsd: body.sizeUsd,
+      slipRoundTripPct: body.slipRoundTripPct,
+    });
     return NextResponse.json({ ok: true, trade });
   } catch (e) {
     return NextResponse.json({ error: e instanceof Error ? e.message : 'paper failed' }, { status: 500 });

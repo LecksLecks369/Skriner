@@ -14,6 +14,7 @@ import { computeScore, detectSweep, execSpreadPct, natrPct, volumeZ, cvdProxy, b
 import { amihudPct, algoProxyOf, analyzeBook, analyzeTape, assembleDeep, illiqProxyOf } from './liquidity';
 import { seriesStore, appendJournal, journalSummary, appendSnapshot, symbolReputation, warmupSeries, scheduleSeriesPersist } from './store';
 import { appendPattern, resolvePending } from './patterns';
+import { autoPaper } from './paper';
 import { getMarketPulse } from './market';
 
 const TOP_DEFAULT = 80;
@@ -734,6 +735,20 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
     },
     4
   );
+
+  /* 5a-bis. Бумажные сделки — сразу после deep-блока: только здесь у монеты уже известны
+     слипейдж и исполнимый спред, а без них симулятор торговал бы спредом с верха книги. */
+  try {
+    const ap = autoPaper(rows);
+    if (ap.opened || ap.closed.tp || ap.closed.sl || ap.closed.timeout) {
+      console.log(
+        `[paper] открыто ${ap.opened}, закрыто: TP ${ap.closed.tp} / SL ${ap.closed.sl} / таймаут ${ap.closed.timeout}`
+      );
+    }
+  } catch (e) {
+    // симулятор не должен ронять скан
+    console.error('[paper]', e instanceof Error ? e.message : e);
+  }
 
   // 5b. ЛИКВИДАЦИИ + LONG/SHORT RATIO розницы (топ-40 по скору; OKX-ликвидации, Bybit/OKX-LSR)
   const liqTargets = [...rows].sort((x, y) => y.score - x.score).slice(0, 40);

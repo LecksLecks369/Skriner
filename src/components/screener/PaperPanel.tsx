@@ -110,27 +110,13 @@ export function PaperPanel({ scan }: { scan: ScanResponse | null }) {
     [load]
   );
 
-  // авто-TP/SL на каждом скане
+  /* TP/SL и таймаут считает сервер на каждом скане (lib/screener/paper.ts) — здесь
+     только обновляем карту строк для ручного закрытия. Раньше сопровождение жило в этом
+     эффекте, то есть работало лишь пока открыта вкладка; теперь дублировать его нельзя —
+     два закрывающих контура по одним и тем же порогам просто гоняются за одной сделкой. */
   useEffect(() => {
     if (!scan) return;
     rowsRef.current = new Map(scan.rows.map((r) => [r.symbol, r]));
-    const open = trades.filter((t) => t.status === 'open');
-    for (const t of open) {
-      const row = rowsRef.current.get(t.symbol);
-      if (!row) continue;
-      // спред ног самой сделки, а не текущей лучшей пары бирж монеты
-      const cur = netSpreadForPair(row, t.buyEx, t.sellEx);
-      if (cur == null) continue;
-      const tp = Math.max(0.05, t.netEntry * 0.35);
-      const sl = t.netEntry + 0.25;
-      if (cur <= tp) {
-        void close(t.id, cur, 'tp', true);
-        toast({ title: `📝 TP: ${t.symbol.replace(/USDT$/, '')}`, description: `спред сошёлся: ${(t.netEntry - cur).toFixed(2)}% прибыли`, duration: 7000 });
-      } else if (cur >= sl) {
-        void close(t.id, cur, 'sl', true);
-        toast({ title: `📝 SL: ${t.symbol.replace(/USDT$/, '')}`, description: 'разрыв расширился против позиции', duration: 7000 });
-      }
-    }
   }, [scan?.ts]);
 
   const manualClose = async (t: PaperTrade) => {
@@ -216,7 +202,7 @@ export function PaperPanel({ scan }: { scan: ScanResponse | null }) {
               <div className="flex justify-between border-t border-zinc-800 pt-1">
                 <span>по выходам</span>
                 <b className="font-mono tabular-nums text-zinc-300">
-                  {Object.entries(analytics.byReason).map(([k, v]) => `${k === 'tp' ? 'TP' : k === 'sl' ? 'SL' : 'вручн'}: ${v.n} (${v.pnl >= 0 ? '+' : ''}${v.pnl.toFixed(1)}%)`).join(' · ')}
+                  {Object.entries(analytics.byReason).map(([k, v]) => `${k === 'tp' ? 'TP' : k === 'sl' ? 'SL' : k === 'timeout' ? 'таймаут' : 'вручн'}: ${v.n} (${v.pnl >= 0 ? '+' : ''}${v.pnl.toFixed(1)}%)`).join(' · ')}
                 </b>
               </div>
             )}
@@ -276,7 +262,7 @@ export function PaperPanel({ scan }: { scan: ScanResponse | null }) {
                       </button>
                     ) : (
                       <span className={t.closeReason === 'tp' ? 'text-emerald-400' : t.closeReason === 'sl' ? 'text-rose-400' : 'text-zinc-500'}>
-                        {t.closeReason === 'tp' ? 'TP' : t.closeReason === 'sl' ? 'SL' : 'вручную'}
+                        {t.closeReason === 'tp' ? 'TP' : t.closeReason === 'sl' ? 'SL' : t.closeReason === 'timeout' ? 'таймаут' : 'вручную'}
                       </span>
                     )}
                   </td>

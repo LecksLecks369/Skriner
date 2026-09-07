@@ -220,7 +220,8 @@ export interface PaperTrade {
   netExit?: number; // нетто-спред на выходе, %
   pnlGrossPct?: number; // netEntry - netExit, без учёта проскальзывания
   pnlPct?: number; // итоговый P&L: gross минус проскальзывание входа и выхода, % от номинала
-  closeReason?: 'tp' | 'sl' | 'manual';
+  closeReason?: 'tp' | 'sl' | 'manual' | 'timeout';
+  auto?: boolean; // сделка заведена автопилотом на сервере, а не руками из карточки монеты
   /* Учёт глубины стакана: без него симулятор считает спред полностью исполнимым любым размером */
   sizeUsd?: number; // размер позиции, на который оценивался слипейдж (по умолчанию $25k)
   slipRoundTripPct?: number; // слипейдж обеих ног на входе (из deep-блока), %
