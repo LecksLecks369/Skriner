@@ -32,6 +32,27 @@ interface RobotAlertItem {
   ts: number;
 }
 
+interface SetupAlertItem {
+  kind: 'breakout' | 'distribution';
+  symbol: string;
+  dir: string;
+  score: number;
+  price: number;
+  reasons: string[];
+  ts: number;
+  /* пробой */
+  level?: number;
+  distAtr?: number;
+  distPct?: number;
+  squeeze?: number;
+  touches?: number;
+  chopScore?: number | null;
+  isErsh?: boolean;
+  /* раздача */
+  distKind?: string;
+  movePct?: number;
+}
+
 function beep() {
   try {
     const Ctx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
@@ -90,8 +111,17 @@ export function evalRules(r: CoinRow, s: Settings): string | null {
   return hit ? conds.filter(([ok]) => ok).map(([, label]) => label).join(' · ') : null;
 }
 
+/** Подписи типов сигналов, выключенных авто-отключением по эджу */
+const MUTED_LABEL: Record<string, string> = {
+  spread: 'спред',
+  robot: 'робот в неликвиде',
+  breakout: 'пробой',
+  distribution: 'раздача/набор',
+};
+
 export function AlertCenter({ settings, paused, scan }: { settings: Settings; paused: boolean; scan: ScanResponse | null }) {
   const [latest, setLatest] = useState<AlertItem[]>([]);
+  const [muted, setMuted] = useState<string[]>([]);
   const esRef = useRef<EventSource | null>(null);
   const cfgRef = useRef(settings);
   const lastAlert = useRef<Map<string, number>>(new Map());
@@ -157,6 +187,14 @@ export function AlertCenter({ settings, paused, scan }: { settings: Settings; pa
           /* ignore */
         }
       });
+      es.addEventListener('ping', (ev) => {
+        try {
+          const j = JSON.parse((ev as MessageEvent).data) as { muted?: string[] };
+          setMuted(j.muted || []);
+        } catch {
+          /* ignore */
+        }
+      });
       es.addEventListener('robot', (ev) => {
         try {
           const j = JSON.parse((ev as MessageEvent).data) as { alerts: RobotAlertItem[] };
@@ -173,6 +211,30 @@ export function AlertCenter({ settings, paused, scan }: { settings: Settings; pa
               cfgRef.current,
               `🤖 ${a.symbol}: робот вошёл в неликвид (алго ${a.algoScore}, неликвид ${a.illiqScore}, нетто ${a.netSpreadPct?.toFixed(2)}%, max $${a.maxPosUsd != null ? Math.round(a.maxPosUsd / 1000) + 'K' : '—'}, вход ${entry} → выход ${exit})`
             );
+          }
+        } catch {
+          /* ignore */
+        }
+      });
+      es.addEventListener('setup', (ev) => {
+        try {
+          const j = JSON.parse((ev as MessageEvent).data) as { alerts: SetupAlertItem[] };
+          for (const a of j.alerts) {
+            const isBreak = a.kind === 'breakout';
+            const arrow = a.dir === 'up' || a.dir === 'long' ? '↑' : '↓';
+            const title = isBreak
+              ? `⚡ ${a.symbol} — готовится пробой ${a.dir === 'up' ? 'вверх' : 'вниз'} ${arrow}`
+              : `📦 ${a.symbol} — ${a.distKind === 'pump_distribution' ? 'раздача в памп' : 'набор в дамп'} (${a.dir === 'short' ? 'шорт' : 'лонг'})`;
+            const head = isBreak
+              ? `готовность ${a.score} · до уровня ${a.distAtr ?? '—'} ATR (${a.distPct != null ? a.distPct.toFixed(2) + '%' : '—'})`
+              : `сила ${a.score} · ход ${a.movePct != null ? (a.movePct > 0 ? '+' : '') + a.movePct.toFixed(2) + '%' : '—'}/15м`;
+            const body = `${head}${a.reasons.length ? ' · ' + a.reasons.slice(0, 3).join(', ') : ''}`;
+            toast({ title, description: body, duration: 12000 });
+            if (cfgRef.current.soundOn) beep();
+            if (cfgRef.current.notifOn && 'Notification' in window && Notification.permission === 'granted') {
+              new Notification(title, { body });
+            }
+            void sendExternal(cfgRef.current, `${title}: ${body}`);
           }
         } catch {
           /* ignore */
@@ -220,13 +282,21 @@ export function AlertCenter({ settings, paused, scan }: { settings: Settings; pa
     }
   }, [scanTs, rulesKey, paused]);
 
-  if (!latest.length) return null;
+  /* Выключенные типы показываем даже когда алертов нет: именно в этот момент молчание
+     стрима и молчание из-за отключения типа выглядят одинаково. */
+  if (!latest.length && !muted.length) return null;
 
   return (
     <div className="fixed bottom-3 right-3 z-50 hidden max-w-[300px] space-y-1.5 sm:block">
       <div className="mb-1 text-right text-[10px] uppercase tracking-wider text-zinc-600">
         живые алерты (SSE)
       </div>
+      {muted.length > 0 && (
+        <div className="rounded-lg border border-rose-500/30 bg-zinc-950/95 p-2 text-[10px] leading-snug text-rose-400/90 shadow-lg backdrop-blur">
+          выключено по отрицательному эджу: {muted.map((m) => MUTED_LABEL[m] ?? m).join(', ')}
+          <span className="text-zinc-500"> — история пишется, подробности во вкладке «Паттерны»</span>
+        </div>
+      )}
       {latest.slice(0, 4).map((a) => (
         <div
           key={`${a.symbol}-${a.ts}`}

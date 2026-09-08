@@ -62,6 +62,40 @@ export interface SweepSignal {
   volMult: number; // объём / средний
 }
 
+/* ---------- Сетапы движения: пробой / ёрш / раздача ---------- */
+
+export interface BreakoutSetup {
+  dir: 'up' | 'down'; // к какой границе диапазона прижата цена
+  score: number; // 0-100 готовность к пробою
+  level: number; // сам уровень
+  distPct: number; // до уровня, % (отрицательное = цена уже вышла)
+  distAtr: number; // до уровня, в ATR — сравнимая между монетами величина
+  rangePct: number; // ширина диапазона, %
+  squeeze: number; // ATR 15м / ATR 60м, <1 = сжатие
+  touches: number; // сколько раз уровень тестировался
+  fired: boolean; // цена уже за уровнем: подтверждение, а не прогноз
+  reasons: string[];
+}
+
+export interface ChopState {
+  score: number; // 0-100 «ершистость»
+  er: number; // коэффициент эффективности Кауфмана 0..1 (чем ниже, тем сильнее пила)
+  flips: number; // доля смен направления свечей
+  wickRatio: number; // доля свечей, где тени длиннее тела
+  bothSides: boolean; // стопы снимали и сверху, и снизу
+  isErsh: boolean;
+}
+
+export type DistKind = 'pump_distribution' | 'dump_absorption' | 'pump_trend' | 'dump_trend';
+
+export interface DistributionState {
+  kind: DistKind;
+  dir: 'long' | 'short' | null; // сторона контр-сигнала; null у обычного тренда
+  score: number; // 0-100 сила расхождения потока и цены
+  movePct: number; // ход за 15 минут, %
+  reasons: string[];
+}
+
 export interface ExchangeRow {
   exchange: ExchangeId;
   price: number; // последняя сделка (для отображения)
@@ -120,6 +154,11 @@ export interface CoinRow {
   whaleNetUsd: number | null; // нетто китовых сделок Bybit (>$50k) за 5м
   whaleCount: number | null;
   rep: { n: number; winRate: number | null } | null; // репутация сигналов монеты по журналу
+
+  /* -------- Сетапы движения (по 1м-свечам; уточняются лентой у топ-40) -------- */
+  breakout: BreakoutSetup | null; // готовность к пробою уровня
+  chop: ChopState | null; // «ёрш»: пила, ложные пробои
+  dist: DistributionState | null; // раздача/набор внутри пампа или дампа
 
   /* -------- Неликвид + алго-детектор -------- */
   illiqProxy: number | null; // 0-100 дешёвая оценка неликвидности (оборот+Амихуд+спред, без стакана)
@@ -218,14 +257,19 @@ export interface PaperTrade {
   status: 'open' | 'closed';
   closedTs?: number;
   netExit?: number; // нетто-спред на выходе, %
-  pnlGrossPct?: number; // netEntry - netExit, без учёта проскальзывания
-  pnlPct?: number; // итоговый P&L: gross минус проскальзывание входа и выхода, % от номинала
-  closeReason?: 'tp' | 'sl' | 'manual' | 'timeout';
+  pnlGrossPct?: number; // netEntry - netExit, без учёта издержек
+  pnlPct?: number; // итоговый P&L: gross минус комиссии круга и проскальзывание, % от номинала
+  /* 'converged' — разрыв сошёлся, но после издержек сделка в минусе: это НЕ тейк.
+     Раньше такой выход помечался как 'tp', и 13 из 13 «выигранных» сделок дали −1.64% в среднем. */
+  closeReason?: 'tp' | 'sl' | 'manual' | 'timeout' | 'converged';
   auto?: boolean; // сделка заведена автопилотом на сервере, а не руками из карточки монеты
   /* Учёт глубины стакана: без него симулятор считает спред полностью исполнимым любым размером */
   sizeUsd?: number; // размер позиции, на который оценивался слипейдж (по умолчанию $25k)
   slipRoundTripPct?: number; // слипейдж обеих ног на входе (из deep-блока), %
   slipModeled?: boolean; // false = стакан был недоступен, P&L завышен на величину слипейджа
+  feesPct?: number; // комиссии полного круга (пара бирж дважды), %
+  costPct?: number; // полные издержки круга: комиссии + проскальзывание входа и выхода, %
+  pnlModelV?: number; // версия модели P&L; сделки старых версий пересчитываются при загрузке
 }
 
 export interface ScanResponse {

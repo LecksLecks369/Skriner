@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import type { PaperTrade } from '@/lib/screener/types';
 import { closePaperTrade, loadPaper, openPaperTrade, setPaperTrades } from '@/lib/screener/paper';
+import { computeEdge } from '@/lib/screener/edge';
 
 export const dynamic = 'force-dynamic';
 
@@ -58,7 +59,11 @@ export async function GET() {
   const sortedByPnl = [...closedSorted].sort((a, b) => (b.pnlPct ?? 0) - (a.pnlPct ?? 0));
   // сколько закрытых сделок посчитано без стакана — на эту долю статистика оптимистична
   const unmodeled = closedSorted.filter((t) => !t.slipModeled).length;
+  /* Матожидание с доверительным интервалом: без интервала средний P&L на десятке сделок
+     читается как факт. Вердикт тот же, что у паттернов, — по положению нуля в интервале. */
+  const edge = computeEdge(pnls);
   const analytics = {
+    edge,
     slipUnmodeled: unmodeled,
     slipUnmodeledPct: closedSorted.length ? Number((unmodeled / closedSorted.length).toFixed(2)) : null,
     profitFactor: grossLoss > 0 ? Number((grossWin / grossLoss).toFixed(2)) : grossWin > 0 ? null : 0,

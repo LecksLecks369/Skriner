@@ -1,7 +1,14 @@
 import { NextRequest } from 'next/server';
-import { getScan } from '@/lib/screener/scan';
+import { BREAKOUT_ALERT, getScan } from '@/lib/screener/scan';
 import type { CoinRow } from '@/lib/screener/types';
 import { numParam } from '@/lib/screener/params';
+import { isPatternMuted } from '@/lib/screener/patterns';
+
+/* Авто-отключение: тип сигнала, у которого весь доверительный интервал матожидания лежит
+   ниже нуля, в алерты не идёт — он доказанно не окупает издержки. Отключение молчаливым
+   быть не должно: список выключенных уезжает в каждом ping, иначе пропавшие алерты
+   неотличимы от сломанного стрима. Запись в историю паттернов при этом продолжается,
+   так что тип включится сам, когда плохие исходы выйдут из окна оценки. */
 
 export const dynamic = 'force-dynamic';
 
@@ -36,6 +43,8 @@ export async function GET(req: NextRequest) {
 
       let lastSent = new Map<string, number>(); // symbol -> ts последнего алерта (cooldown 90с)
       let robotSent = new Map<string, number>(); // отдельный кулдаун паттерна «робот вошёл» — 10 мин
+      const breakoutSent = new Map<string, number>(); // готовность к пробою — 15 мин
+      const distSent = new Map<string, number>(); // раздача/набор — 20 мин
       let running = true;
 
       const tick = async () => {
@@ -43,10 +52,17 @@ export async function GET(req: NextRequest) {
           try {
             const resp = await getScan(80, init.refExchange as ExchangeIdOrAuto);
             const now = Date.now();
+            const muted = {
+              spread: isPatternMuted('spread'),
+              robot: isPatternMuted('robot'),
+              breakout: isPatternMuted('breakout'),
+              distribution: isPatternMuted('distribution'),
+            };
             const alerts: Array<Record<string, unknown>> = [];
             for (const row of resp.rows as CoinRow[]) {
               const spread = row.netSpreadPct;
-              const isSpread = spread != null && spread >= init.thresholdPct;
+              // выключенный спред снимает только спред-триггер: алерт по скору — другой сигнал
+              const isSpread = !muted.spread && spread != null && spread >= init.thresholdPct;
               const isScore = init.minScore > 0 && row.score >= init.minScore;
               if (!isSpread && !isScore) continue;
               const last = lastSent.get(row.symbol) || 0;
@@ -73,6 +89,7 @@ export async function GET(req: NextRequest) {
             // Паттерн «🤖 робот вошёл в неликвид»: алго-скор ≥55 + неликвид ≥50 + спред
             const robotAlerts: Array<Record<string, unknown>> = [];
             for (const row of resp.rows as CoinRow[]) {
+              if (muted.robot) break;
               const d = row.deep;
               if (!d?.pattern?.robotIlliquid) continue;
               const last = robotSent.get(row.symbol) || 0;
@@ -94,7 +111,62 @@ export async function GET(req: NextRequest) {
             }
             if (robotAlerts.length) send('robot', { alerts: robotAlerts, ts: now });
 
-            send('ping', { ts: now, statuses: resp.statuses });
+            /* Сетапы движения: пробой — только ДО выхода за уровень (иначе это уже
+               не предупреждение, а констатация), раздача/набор — только когда поток
+               расходится с ценой. Пороги те же, по которым сигнал пишется в историю
+               паттернов, поэтому win-rate во вкладке «История» относится ровно к этим
+               алертам. Ёрш отдельным алертом не шлём — он приезжает пометкой внутри
+               пробоя: его смысл в том, чтобы НЕ входить. */
+            const setupAlerts: Array<Record<string, unknown>> = [];
+            for (const row of resp.rows as CoinRow[]) {
+              const b = row.breakout;
+              if (b && !muted.breakout && !b.fired && b.score >= BREAKOUT_ALERT) {
+                if (now - (breakoutSent.get(row.symbol) || 0) >= 15 * 60_000) {
+                  breakoutSent.set(row.symbol, now);
+                  setupAlerts.push({
+                    kind: 'breakout',
+                    symbol: row.symbol,
+                    dir: b.dir,
+                    score: b.score,
+                    level: b.level,
+                    distAtr: b.distAtr,
+                    distPct: b.distPct,
+                    squeeze: b.squeeze,
+                    touches: b.touches,
+                    chopScore: row.chop?.score ?? null,
+                    isErsh: row.chop?.isErsh ?? false,
+                    reasons: b.reasons.slice(0, 4),
+                    price: row.price,
+                    ts: now,
+                  });
+                }
+              }
+              const d = row.dist;
+              if (d && d.dir && !muted.distribution) {
+                if (now - (distSent.get(row.symbol) || 0) >= 20 * 60_000) {
+                  distSent.set(row.symbol, now);
+                  setupAlerts.push({
+                    kind: 'distribution',
+                    symbol: row.symbol,
+                    dir: d.dir,
+                    distKind: d.kind,
+                    score: d.score,
+                    movePct: d.movePct,
+                    reasons: d.reasons.slice(0, 4),
+                    price: row.price,
+                    ts: now,
+                  });
+                }
+              }
+            }
+            if (setupAlerts.length) send('setup', { alerts: setupAlerts, ts: now });
+
+            send('ping', {
+              ts: now,
+              statuses: resp.statuses,
+              // какие типы сигналов сейчас выключены по отрицательному эджу
+              muted: Object.entries(muted).filter(([, v]) => v).map(([k]) => k),
+            });
           } catch {
             send('ping', { ts: Date.now(), error: 'scan-failed' });
           }

@@ -5,6 +5,10 @@ import type { ExchangeId, ScanResponse } from '@/lib/screener/types';
 
 export interface Filters {
   search: string;
+  /* Какие монеты вообще попадают в скан. Это НЕ фильтр по уже полученным строкам:
+     универсум задаётся на сервере полосой оборота, потому что «топ-80 по обороту»
+     физически не содержит неликвида — нижняя граница выдачи была ~$21M за сутки. */
+  universe: 'all' | 'illiquid';
   minTurnoverM: number; // млн USD
   minSpread: number; // % кросс-спред
   minNet: number; // % нетто-спред
@@ -15,6 +19,9 @@ export interface Filters {
   minFundingSpread: number; // разброс фандинга между биржами ≥ %
   minWhale: number; // |китовые сделки| ≥ тыс. USD за 5м
   minLiq: number; // ликвидации за 15м ≥ тыс. USD (каскад)
+  minBreakout: number; // готовность к пробою ≥ (0 = не фильтровать)
+  onlyErsh: boolean; // только «ерши» — зоны ложных пробоев
+  onlyDist: boolean; // только раздача/набор (контр-сигнал внутри пампа или дампа)
   exchanges: ExchangeId[]; // пусто = все
   onlyWatchlist: boolean;
   sortKey: string;
@@ -57,6 +64,7 @@ export interface Settings {
 
 const DEFAULT_FILTERS: Filters = {
   search: '',
+  universe: 'all',
   minTurnoverM: 5,
   minSpread: 0,
   minNet: 0,
@@ -67,6 +75,9 @@ const DEFAULT_FILTERS: Filters = {
   minFundingSpread: 0,
   minWhale: 0,
   minLiq: 0,
+  minBreakout: 0,
+  onlyErsh: false,
+  onlyDist: false,
   exchanges: [],
   onlyWatchlist: false,
   sortKey: 'score',
@@ -96,12 +107,23 @@ const DEFAULT_SETTINGS: Settings = {
   notifyTgChat: '',
 };
 
+/* Чтение из localStorage.
+   Слияние с дефолтом нужно объектам настроек: у пользователя лежит вчерашняя форма, и
+   новые поля должны прийти из def. Но объектный спред НЕЛЬЗЯ применять к массиву:
+   `{ ...[], ...['BTCUSDT'] }` даёт `{0:'BTCUSDT'}` — объект, у которого нет ни includes,
+   ни map, и первый же рендер таблицы падает с «watchlist.includes is not a function»,
+   а экран остаётся пустым. Форму значения выбираем по типу дефолта. */
 function loadLS<T>(key: string, def: T): T {
   if (typeof window === 'undefined') return def;
   try {
     const raw = window.localStorage.getItem(key);
     if (!raw) return def;
-    return { ...def, ...(JSON.parse(raw) as T) };
+    const parsed = JSON.parse(raw) as T;
+    if (Array.isArray(def)) return (Array.isArray(parsed) ? parsed : def) as T;
+    if (def && typeof def === 'object' && parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return { ...def, ...parsed };
+    }
+    return parsed == null ? def : parsed;
   } catch {
     return def;
   }
@@ -125,10 +147,16 @@ export function useScreener() {
   const [paused, setPaused] = useState(false);
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
+  const filtersRef = useRef(filters);
+  filtersRef.current = filters;
 
   const setFilters = useCallback((f: Partial<Filters>) => {
     setFiltersState((prev) => {
       const next = { ...prev, ...f };
+      /* Переход в неликвид с унаследованным порогом оборота дал бы пустую таблицу:
+         полоса неликвида ($0.3–20M) целиком ниже привычного фильтра в 5M, и экран
+         выглядел бы сломанным, а не отфильтрованным. */
+      if (f.universe === 'illiquid' && prev.universe !== 'illiquid' && next.minTurnoverM > 0) next.minTurnoverM = 0;
       saveLS('ms_filters', next);
       return next;
     });
@@ -230,7 +258,11 @@ export function useScreener() {
   // polling /api/scan
   const fetchScan = useCallback(async () => {
     try {
-      const qs = new URLSearchParams({ top: '80', ref: settingsRef.current.refExchange });
+      const qs = new URLSearchParams({
+        top: '80',
+        ref: settingsRef.current.refExchange,
+        universe: filtersRef.current.universe || 'all',
+      });
       const res = await fetch(`/api/scan?${qs}`, { cache: 'no-store' });
       if (res.ok) {
         const j = (await res.json()) as ScanResponse;
@@ -257,7 +289,8 @@ export function useScreener() {
       clearInterval(iv);
       document.removeEventListener('visibilitychange', onVis);
     };
-  }, [fetchScan, paused]);
+    // universe в зависимостях: смена универсума — это другой набор монет, ждать 30с нельзя
+  }, [fetchScan, paused, filters.universe]);
 
   return {
     filters,

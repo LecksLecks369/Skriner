@@ -319,6 +319,87 @@ export function CoinModal({
           <SpreadChart points={hist} threshold={threshold} />
         </section>
 
+        {/* сетапы движения: пробой / ёрш / раздача */}
+        {(row.breakout || row.chop || row.dist) && (
+          <section className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-3">
+            <div className="mb-2 text-xs text-zinc-500">Сетапы движения</div>
+            <div className="space-y-2.5 text-xs">
+              {row.breakout && (
+                <div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span
+                      className={`rounded px-1.5 py-0.5 text-[11px] font-semibold ${
+                        row.breakout.fired
+                          ? 'bg-zinc-700/40 text-zinc-400'
+                          : row.breakout.score >= 60
+                            ? 'bg-emerald-500/15 text-emerald-400'
+                            : 'bg-zinc-700/40 text-zinc-300'
+                      }`}
+                    >
+                      ⚡ Пробой {row.breakout.dir === 'up' ? 'вверх ↑' : 'вниз ↓'} · готовность {row.breakout.score}
+                    </span>
+                    {row.breakout.fired && <span className="text-[11px] text-zinc-500">цена уже за уровнем — это подтверждение, а не прогноз</span>}
+                  </div>
+                  <div className="mt-1 text-[11px] text-zinc-500">
+                    уровень {fmtPrice(row.breakout.level)} · до него {row.breakout.distAtr} ATR ({row.breakout.distPct.toFixed(2)}%) · диапазон{' '}
+                    {row.breakout.rangePct}% · сжатие ×{row.breakout.squeeze} · тестов уровня {row.breakout.touches}
+                  </div>
+                  {row.breakout.reasons.length > 0 && (
+                    <div className="mt-1 text-[11px] text-zinc-400">{row.breakout.reasons.join(' · ')}</div>
+                  )}
+                </div>
+              )}
+
+              {row.chop && (
+                <div>
+                  <span
+                    className={`rounded px-1.5 py-0.5 text-[11px] font-semibold ${
+                      row.chop.isErsh ? 'bg-orange-500/15 text-orange-400' : 'bg-zinc-700/40 text-zinc-300'
+                    }`}
+                  >
+                    〰 Ёрш {row.chop.score}
+                    {row.chop.isErsh ? ' — пила, пробои ложные' : ''}
+                  </span>
+                  <div className="mt-1 text-[11px] text-zinc-500">
+                    эффективность хода {row.chop.er} (1 = прямая линия, 0 = топтание) · смены направления {row.chop.flips} · свечей с
+                    длинными тенями {Math.round(row.chop.wickRatio * 100)}%
+                    {row.chop.bothSides ? ' · стопы снимали с обеих сторон' : ''}
+                  </div>
+                </div>
+              )}
+
+              {row.dist && (
+                <div>
+                  <span
+                    className={`rounded px-1.5 py-0.5 text-[11px] font-semibold ${
+                      row.dist.kind === 'pump_distribution'
+                        ? 'bg-rose-500/15 text-rose-400'
+                        : row.dist.kind === 'dump_absorption'
+                          ? 'bg-emerald-500/15 text-emerald-400'
+                          : 'bg-zinc-700/40 text-zinc-300'
+                    }`}
+                  >
+                    📦{' '}
+                    {row.dist.kind === 'pump_distribution'
+                      ? 'Раздача в памп — сторона шорта'
+                      : row.dist.kind === 'dump_absorption'
+                        ? 'Набор в дамп — сторона лонга'
+                        : row.dist.kind === 'pump_trend'
+                          ? 'Рост подтверждён потоком'
+                          : 'Падение подтверждено потоком'}{' '}
+                    · {row.dist.score}
+                  </span>
+                  <div className="mt-1 text-[11px] text-zinc-500">
+                    ход {row.dist.movePct > 0 ? '+' : ''}
+                    {row.dist.movePct.toFixed(2)}% за 15 минут
+                  </div>
+                  {row.dist.reasons.length > 0 && <div className="mt-1 text-[11px] text-zinc-400">{row.dist.reasons.join(' · ')}</div>}
+                </div>
+              )}
+            </div>
+          </section>
+        )}
+
         {/* по биржам */}
         <section>
           <div className="mb-1 text-xs text-zinc-500">

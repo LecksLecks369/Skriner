@@ -10,7 +10,9 @@
    сделку, которая сначала сходила в минус на 4% и закрылась в убытке — просадка
    в метрику не входила вовсе, и win-rate завышался.
 
-   spread (арбитраж) — исход не направленный: разрыв схлопнулся вдвое за 30 минут.
+   spread (арбитраж) — тоже симуляция сделки, а не факт схлопывания разрыва: P&L круга
+   (спред входа − спред выхода − комиссии обеих ног дважды). «Разрыв сошёлся вдвое» само по себе
+   не значит прибыли — круг регулярно стоит дороже разрыва; такой выход помечается 'converged'.
 
    Оценка исходов: сначала серии в памяти (до ~9ч), затем 1м-клайны биржи сигнала (до ~85м назад);
    если и там пусто — сигнал ждёт; старше 6 часов — помечается истёкшим (в win-rate не идёт). */
@@ -20,8 +22,17 @@ import path from 'path';
 import type { Candle, ExchangeId } from './types';
 import { fetchKlines } from './exchanges';
 import { seriesStore } from './store';
+import {
+  arbConvergeLevelPct,
+  arbFeesPct,
+  arbSlLevelPct,
+  arbTpTargetPct,
+  directionalCostPct,
+  feePairPct,
+} from './costs';
+import { computeEdge, type EdgeReport } from './edge';
 
-export type PatternKind = 'spread' | 'robot' | 'sweep' | 'whale' | 'funding';
+export type PatternKind = 'spread' | 'robot' | 'sweep' | 'whale' | 'funding' | 'breakout' | 'distribution' | 'chop';
 
 export interface PatternSignal {
   key: string;
@@ -51,13 +62,26 @@ export interface PatternSignal {
   hiPrice?: number;
   loPrice?: number;
   spreadPct?: number;
+  /* для сетапов движения */
+  setupScore?: number; // готовность пробоя / сила раздачи / ершистость
+  level?: number; // уровень пробоя
+  distAtr?: number; // расстояние до уровня в ATR на момент сигнала
+  distKind?: string; // pump_distribution | dump_absorption
+  movePct?: number; // ход, вызвавший сигнал раздачи
+  erThr?: number; // для «ерша»: порог эффективности, ниже которого пила считается сохранившейся
+  bandPct?: number; // legacy: полуширина диапазона у сигналов до перехода на будущий ER
 }
 
-/** Версия методики оценки. Исходы, посчитанные старой методикой (MFE без учёта
-    просадки), несравнимы с новыми — при загрузке они выбрасываются и пересчитываются. */
-export const OUTCOME_VERSION = 2;
+/** Версия методики оценки. Исходы старых версий несравнимы с новыми и при загрузке
+    выбрасываются на пересчёт.
+    v2: выход симулируется по пути цены (тейк/стоп/таймаут) вместо MFE без просадки.
+    v3: из результата вычитаются издержки круга — комиссии тейкером на входе и выходе;
+        для спреда впервые считается сам результат сделки, а не факт схлопывания разрыва
+        (схлопывание вдвое ничего не говорит о прибыли: круг может стоить дороже разрыва). */
+export const OUTCOME_VERSION = 3;
 
-export type ExitReason = 'tp' | 'sl' | 'timeout';
+/** 'converged' — разрыв сошёлся, но прибыли после издержек нет; тейком это не считается */
+export type ExitReason = 'tp' | 'sl' | 'timeout' | 'converged';
 
 export interface PatternOutcome {
   ts: number; // время оценки
@@ -66,10 +90,14 @@ export interface PatternOutcome {
   movePct: number | null; // движение на краю 30-минутного окна (в сторону dir)
   win: boolean | null; // null = истёк без оценки
   expired?: boolean;
-  /* поля симуляции выхода (только направленные паттерны, v2+) */
+  /* поля симуляции выхода (v2+; для спреда — с v3) */
   v?: number; // версия методики
   exit?: ExitReason; // что сработало первым
-  pnlPct?: number | null; // результат сделки по правилу выхода, % (тейк / −стоп / ход к краю окна)
+  pnlPct?: number | null; // ЧИСТЫЙ результат сделки: ход по правилу выхода минус издержки круга, %
+  pnlGrossPct?: number | null; // тот же результат до вычета издержек, %
+  costPct?: number; // издержки круга, вычтенные из результата, %
+  costSlipModeled?: boolean; // false = проскальзывание не учтено (только комиссии), результат завышен
+  erAfter?: number | null; // «ёрш»: эффективность хода на будущем окне — та же величина, что и в детекторе
 }
 
 /* ---------------- Хранилище ---------------- */
@@ -89,6 +117,9 @@ export const WIN_THR: Record<PatternKind, number> = {
   sweep: 0.4,
   whale: 0.4,
   funding: 0.4,
+  breakout: 0.5,
+  distribution: 0.5,
+  chop: 0, // ненаправленный: исход — удержался ли диапазон
 };
 
 /** Стоп-лосс: просадка, на которой сделка закрывается в минус. 1:1 к тейку —
@@ -99,6 +130,9 @@ export const STOP_THR: Record<PatternKind, number> = {
   sweep: 0.4,
   whale: 0.4,
   funding: 0.4,
+  breakout: 0.5,
+  distribution: 0.5,
+  chop: 0,
 };
 
 const COOLDOWN_MS: Record<PatternKind, number> = {
@@ -107,15 +141,24 @@ const COOLDOWN_MS: Record<PatternKind, number> = {
   sweep: 30 * 60_000,
   whale: 60 * 60_000,
   funding: 60 * 60_000,
+  breakout: 20 * 60_000,
+  distribution: 30 * 60_000,
+  chop: 30 * 60_000,
 };
 
 export const PATTERN_META: Record<PatternKind, { icon: string; name: string; hint: string }> = {
-  spread: { icon: '🔀', name: 'Спред', hint: 'разрыв схлопнулся вдвое за 30 минут' },
-  robot: { icon: '🤖', name: 'Робот вошёл', hint: 'тейк +0.5% раньше стопа −0.5% (30 минут)' },
-  sweep: { icon: '🌊', name: 'Свип', hint: 'откат +0.4% раньше стопа −0.4% (30 минут)' },
-  whale: { icon: '🐋', name: 'Киты', hint: 'ход по потоку +0.4% раньше стопа −0.4% (30 минут)' },
-  funding: { icon: '💸', name: 'Фандинг', hint: 'ход против толпы +0.4% раньше стопа −0.4% (30 минут)' },
+  spread: { icon: '🔀', name: 'Спред', hint: 'сделка на разрыве: прибыль после комиссий круга (30 минут)' },
+  robot: { icon: '🤖', name: 'Робот вошёл', hint: 'тейк +0.5% раньше стопа −0.5%, минус круг тейкером (30 минут)' },
+  sweep: { icon: '🌊', name: 'Свип', hint: 'откат +0.4% раньше стопа −0.4%, минус круг тейкером (30 минут)' },
+  whale: { icon: '🐋', name: 'Киты', hint: 'ход по потоку +0.4% раньше стопа −0.4%, минус круг тейкером (30 минут)' },
+  funding: { icon: '💸', name: 'Фандинг', hint: 'ход против толпы +0.4% раньше стопа −0.4%, минус круг тейкером (30 минут)' },
+  breakout: { icon: '⚡', name: 'Пробой', hint: 'ход в сторону уровня +0.5% раньше стопа −0.5% (30 минут)' },
+  distribution: { icon: '📦', name: 'Раздача', hint: 'разворот против пампа/дампа +0.5% раньше стопа −0.5% (30 минут)' },
+  chop: { icon: '〰', name: 'Ёрш', hint: 'пила сохранилась: эффективность хода за следующие 30 минут ≤ 0.32 — тренда не случилось' },
 };
+
+/** Все типы паттернов — из PATTERN_META, чтобы список не расходился при добавлении нового */
+const ALL_KINDS = Object.keys(PATTERN_META) as PatternKind[];
 
 interface PatternGlobal {
   __screenerPatterns: {
@@ -157,13 +200,20 @@ function loadOutcomes(): Record<string, PatternOutcome> {
   try {
     if (fs.existsSync(OUTCOMES_FILE)) {
       const raw = JSON.parse(fs.readFileSync(OUTCOMES_FILE, 'utf8')) as Record<string, PatternOutcome>;
-      /* Направленные исходы старой методики выбрасываем: там «победа» = MFE дошёл до
-         порога, просадка не учитывалась, и такие win/loss нельзя складывать с новыми.
-         Сигналы, по которым ещё есть данные, дооценятся заново; остальные истекут. */
+      /* Исходы старых версий выбрасываем: до v2 «победа» = MFE дошёл до порога без учёта
+         просадки, до v3 результат считался без издержек круга, а у спреда его не было вовсе
+         (записывался только факт схлопывания разрыва). Складывать такие win/loss с новыми
+         нельзя. Сигналы, по которым ещё есть данные, дооценятся заново; остальные истекут. */
       let dropped = 0;
       for (const [key, oc] of Object.entries(raw)) {
-        const isSpread = key.startsWith('spread:');
-        const stale = !isSpread && oc.win != null && (oc.v ?? 1) < OUTCOME_VERSION;
+        /* «Ёрш» оценивался полосой цены (удержался ли диапазон ±bandPct). Полоса бралась
+           от окна детекции, а не от горизонта оценки, и за 30 минут её пробивал обычный
+           шум: первая же партия дала 1 из 7 при отклонениях 0.9–1.9% против полосы 0.45%.
+           Критерий заменён на ту же величину, которой ёрш и определяется — эффективность
+           хода на будущем окне. Исходы без erAfter посчитаны по снятому правилу и
+           смешивать их с новыми нельзя. */
+        const legacyChop = key.startsWith('chop:') && oc.win != null && oc.erAfter == null;
+        const stale = legacyChop || (oc.win != null && (oc.v ?? 1) < OUTCOME_VERSION);
         if (stale) {
           dropped++;
           continue;
@@ -273,14 +323,20 @@ async function klinesPath(ex: ExchangeId, native: string): Promise<PathPt[] | nu
 /** Сделка по пути цены: тейк/стоп/выход по времени. Побеждает то, что задето первым;
     в пределах одной свечи порядок неизвестен, поэтому приоритет у стопа.
     MFE/MAE считаются только до момента выхода — после закрытия сделки движение цены
-    к результату отношения не имеет. */
+    к результату отношения не имеет.
+
+    Из результата вычитается круг тейкером (вход + выход) на бирже сигнала: тейк +0.4%
+    при круге ~0.11% — это не +0.4%, и «выигрышем» такая сделка считается только если
+    остаётся в плюсе после издержек. Проскальзывание здесь не моделируется (стакан на
+    момент сигнала не сохранён), поэтому результат остаётся верхней оценкой. */
 function evalDirectional(
   path: PathPt[],
   entry: number,
   dir: 'long' | 'short',
   ts0: number,
   tpPct: number,
-  slPct: number
+  slPct: number,
+  costPct: number
 ): PatternOutcome | null {
   const win = path.filter((p) => p.ts >= ts0 && p.ts <= ts0 + HORIZON_MS);
   if (win.length < 8) return null; // покрытия окна нет — не оцениваем
@@ -309,7 +365,8 @@ function evalDirectional(
   const target = ts0 + HORIZON_MS;
   for (const p of win) if (Math.abs(p.ts - target) < Math.abs(edge.ts - target)) edge = p;
   const move = dir === 'long' ? ((edge.c - entry) / entry) * 100 : ((entry - edge.c) / entry) * 100;
-  const pnl = exit === 'tp' ? tpPct : exit === 'sl' ? -slPct : move;
+  const gross = exit === 'tp' ? tpPct : exit === 'sl' ? -slPct : move;
+  const pnl = gross - costPct;
   const r3 = (v: number) => Math.round(v * 1000) / 1000;
   return {
     ts: Date.now(),
@@ -320,54 +377,143 @@ function evalDirectional(
     v: OUTCOME_VERSION,
     exit,
     pnlPct: r3(pnl),
+    pnlGrossPct: r3(gross),
+    costPct: r3(costPct),
+    costSlipModeled: false,
   };
 }
 
-/** Схлопывание спреда: min(spread в окне [ts+5м, ts+30м]) <= 0.5 * spread0 */
-function evalSpreadSeries(symbol: string, ts0: number, spread0: number): PatternOutcome | null {
-  const hist = seriesStore.getSpreadHistory(symbol);
-  const from = ts0 + 5 * 60_000;
-  const to = ts0 + HORIZON_MS;
-  const after = hist.filter((p) => p.ts >= from && p.ts <= to);
-  if (after.length < 8) return null;
-  const minAfter = Math.min(...after.map((p) => p.v));
+/**
+ * Исход «ерша»: цена осталась в пределах ±bandPct от точки сигнала все 30 минут.
+ *
+ * Ненаправленный паттерн: он не предлагает сделку, он предупреждает, что пробои
+ * в ближайший час скорее всего ложные. Поэтому win = диапазон удержался, а pnlPct
+ * не считается вовсе — приписывать «прибыль» предупреждению значило бы выдумывать
+ * сделку, которой не было.
+ */
+function minuteCloses(path: PathPt[], ts0: number): number[] {
+  const buckets = new Map<number, number>();
+  for (const p of path) {
+    if (p.ts < ts0 || p.ts > ts0 + HORIZON_MS) continue;
+    buckets.set(Math.floor(p.ts / 60_000), p.c); // путь хронологический — в минуте остаётся последняя цена
+  }
+  return [...buckets.entries()].sort((a, b) => a[0] - b[0]).map(([, c]) => c);
+}
+
+function evalChopPersist(path: PathPt[], entry: number, ts0: number, erMax: number): PatternOutcome | null {
+  const closes = minuteCloses(path, ts0);
+  if (closes.length < 12) return null; // на десятке точек эффективность — шум
+  let travelled = 0;
+  for (let i = 1; i < closes.length; i++) travelled += Math.abs(closes[i] - closes[i - 1]);
+  if (travelled <= 0) return null;
+  const net = closes[closes.length - 1] - closes[0];
+  const er = Math.abs(net) / travelled;
+  const r3 = (v: number) => Math.round(v * 1000) / 1000;
   return {
     ts: Date.now(),
-    mfePct: Math.round(((spread0 - minAfter) / Math.max(spread0, 1e-9)) * 1000) / 1000, // % схлопывания
-    maePct: null,
-    movePct: Math.round((minAfter - spread0) * 1000) / 1000, // до какого уровня дошёл, п.п.
-    win: minAfter <= spread0 * 0.5,
+    mfePct: null,
+    maePct: entry > 0 ? r3((Math.max(...closes.map((c) => Math.abs(c - entry))) / entry) * 100) : null,
+    movePct: entry > 0 ? r3((net / entry) * 100) : null,
+    win: er <= erMax,
     v: OUTCOME_VERSION,
+    pnlPct: null,
+    erAfter: r3(er),
   };
 }
 
-async function evalSpreadKlines(sig: PatternSignal): Promise<PatternOutcome | null> {
-  if (!sig.hiEx || !sig.loEx || !sig.hiNative || !sig.loNative || !sig.hiPrice || !sig.loPrice || !sig.spreadPct) return null;
+/** Точка пути кросс-спреда: валовый разрыв между биржами сделки, % */
+interface SpreadPt {
+  ts: number;
+  gross: number;
+}
+
+/**
+ * Симуляция арбитражной сделки по пути спреда — то же правило выхода, что у бумажных сделок.
+ *
+ * Раньше исход спреда был «разрыв схлопнулся вдвое за 30 минут»: факт о рынке, а не о сделке.
+ * Схлопывание вдвое ничего не говорит о прибыли — круг (комиссии обеих ног дважды) регулярно
+ * стоит дороже самого разрыва, и такой «выигрыш» оказывается убытком. Поэтому считается P&L:
+ * тейк — только выход с прибылью после издержек, схлопывание без прибыли — 'converged'.
+ *
+ * Проскальзывание не моделируется: стакан на момент сигнала не сохранён. Результат — верхняя
+ * оценка, costSlipModeled=false говорит об этом явно.
+ */
+function simulateSpreadTrade(sig: PatternSignal, path: SpreadPt[]): PatternOutcome | null {
+  const { hiEx, loEx } = sig;
+  if (!hiEx || !loEx) return null;
+  // покупка на loEx (дешёвая сторона), продажа на hiEx
+  const feePair = feePairPct(loEx, hiEx);
+  const netEntry = sig.netPct ?? (sig.spreadPct != null ? sig.spreadPct - feePair : null);
+  if (netEntry == null) return null;
+  const cost = arbFeesPct(loEx, hiEx);
+  const from = sig.ts + 5 * 60_000;
+  const to = sig.ts + HORIZON_MS;
+  const win = path.filter((p) => p.ts >= from && p.ts <= to && Number.isFinite(p.gross)).sort((a, b) => a.ts - b.ts);
+  if (win.length < 8) return null;
+
+  const tp = arbTpTargetPct(netEntry, cost);
+  const slLvl = arbSlLevelPct(netEntry);
+  const convLvl = arbConvergeLevelPct(netEntry);
+  let exit: ExitReason = 'timeout';
+  let mfe = 0;
+  let mae = 0;
+  let netNow = netEntry;
+  let pnl = -cost;
+  for (const p of win) {
+    netNow = p.gross - feePair;
+    pnl = netEntry - netNow - cost;
+    mfe = Math.max(mfe, pnl);
+    mae = Math.max(mae, -pnl);
+    if (netNow >= slLvl) {
+      exit = 'sl';
+      break;
+    }
+    if (tp != null && pnl >= tp) {
+      exit = 'tp';
+      break;
+    }
+    if (netNow <= convLvl) {
+      // разрыв сошёлся, но прибыли нет: держать нечего, и тейком это не является
+      exit = 'converged';
+      break;
+    }
+  }
+  const r3 = (v: number) => Math.round(v * 1000) / 1000;
+  return {
+    ts: Date.now(),
+    mfePct: r3(mfe), // лучший P&L за окно, п.п. (не % схлопывания, как было до v3)
+    maePct: r3(mae),
+    movePct: r3(netNow - netEntry), // насколько сдвинулся нетто-спред, п.п. (минус = сошёлся)
+    win: pnl > 0,
+    v: OUTCOME_VERSION,
+    exit,
+    pnlPct: r3(pnl),
+    pnlGrossPct: r3(pnl + cost),
+    costPct: r3(cost),
+    costSlipModeled: false,
+  };
+}
+
+/** Путь спреда из серий в памяти: кросс-спред монеты (валовый, до комиссий) */
+function spreadPathFromSeries(symbol: string): SpreadPt[] {
+  return seriesStore.getSpreadHistory(symbol).map((p) => ({ ts: p.ts, gross: p.v }));
+}
+
+/** Путь спреда из 1м-клайнов обеих бирж: разрыв закрытий как прокси разрыва котировок */
+async function spreadPathFromKlines(sig: PatternSignal): Promise<SpreadPt[] | null> {
+  if (!sig.hiEx || !sig.loEx || !sig.hiNative || !sig.loNative) return null;
   const [hi, lo] = await Promise.all([klinesPath(sig.hiEx, sig.hiNative), klinesPath(sig.loEx, sig.loNative)]);
   if (!hi || !lo) return null;
   const loMap = new Map(lo.map((p) => [Math.round(p.ts / 60_000), p.c]));
-  const from = sig.ts + 5 * 60_000;
-  const to = sig.ts + HORIZON_MS;
-  const spreads: number[] = [];
+  const out: SpreadPt[] = [];
   for (const p of hi) {
-    if (p.ts < from || p.ts > to) continue;
     const lc = loMap.get(Math.round(p.ts / 60_000));
     if (!lc) continue;
-    const hiC = p.c;
-    const mid = (hiC + lc) / 2;
+    const mid = (p.c + lc) / 2;
     if (mid <= 0) continue;
-    spreads.push(((Math.max(hiC, lc) - Math.min(hiC, lc)) / mid) * 100);
+    out.push({ ts: p.ts, gross: ((Math.max(p.c, lc) - Math.min(p.c, lc)) / mid) * 100 });
   }
-  if (spreads.length < 8) return null;
-  const minAfter = Math.min(...spreads);
-  return {
-    ts: Date.now(),
-    mfePct: Math.round(((sig.spreadPct - minAfter) / Math.max(sig.spreadPct, 1e-9)) * 1000) / 1000,
-    maePct: null,
-    movePct: Math.round((minAfter - sig.spreadPct) * 1000) / 1000,
-    win: minAfter <= sig.spreadPct * 0.5,
-    v: OUTCOME_VERSION,
-  };
+  return out.length ? out : null;
 }
 
 /** Дооценка нерешённых сигналов (батч до RESOLVE_BATCH за вызов) */
@@ -386,18 +532,29 @@ export async function resolvePending(): Promise<number> {
     for (const sig of pending) {
       try {
         let oc: PatternOutcome | null = null;
-        if (sig.pattern === 'spread' && sig.spreadPct != null) {
-          oc = evalSpreadSeries(sig.symbol, sig.ts, sig.spreadPct);
-          if (!oc) oc = await evalSpreadKlines(sig);
+        if (sig.pattern === 'spread' && (sig.netPct != null || sig.spreadPct != null)) {
+          oc = simulateSpreadTrade(sig, spreadPathFromSeries(sig.symbol));
+          if (!oc) {
+            const path = await spreadPathFromKlines(sig);
+            if (path) oc = simulateSpreadTrade(sig, path);
+          }
+        } else if (sig.pattern === 'chop') {
+          const erMax = sig.erThr && sig.erThr > 0 ? sig.erThr : 0.32;
+          oc = evalChopPersist(seriesPath(sig.symbol, sig.ex), sig.price, sig.ts, erMax);
+          if (!oc && sig.ex && sig.native) {
+            const path = await klinesPath(sig.ex, sig.native);
+            if (path) oc = evalChopPersist(path, sig.price, sig.ts, erMax);
+          }
         } else if (sig.dir !== 'arb') {
           const tp = WIN_THR[sig.pattern] ?? 0.4;
           const sl = STOP_THR[sig.pattern] ?? tp;
+          const cost = directionalCostPct(sig.ex); // круг тейкером на бирже сигнала
           // 1) серии в памяти (покрывают до ~9ч при живом сервере)
-          oc = evalDirectional(seriesPath(sig.symbol, sig.ex), sig.price, sig.dir, sig.ts, tp, sl);
+          oc = evalDirectional(seriesPath(sig.symbol, sig.ex), sig.price, sig.dir, sig.ts, tp, sl, cost);
           // 2) клайны биржи сигнала (покрывают ~85 минут назад)
           if (!oc && sig.ex && sig.native) {
             const path = await klinesPath(sig.ex, sig.native);
-            if (path) oc = evalDirectional(path, sig.price, sig.dir, sig.ts, tp, sl);
+            if (path) oc = evalDirectional(path, sig.price, sig.dir, sig.ts, tp, sl, cost);
           }
         }
         if (!oc) {
@@ -439,10 +596,63 @@ export interface PatternStat {
   avgMfeLoss: number | null; // средний ход у проигравших, %
   lastTs: number | null;
   /* результат по правилу выхода — то, ради чего считается статистика (v2+) */
-  expectancyPct: number | null; // среднее pnl на сделку, %; отрицательное = паттерн не окупается
+  expectancyPct: number | null; // среднее ЧИСТОЕ pnl на сделку, %; отрицательное = паттерн не окупается
+  expectancyGrossPct: number | null; // то же до вычета издержек — видно, сколько съедает круг
+  avgCostPct: number | null; // средние издержки круга на сделку, %
   sumPnlPct: number | null; // суммарный pnl по разрешённым сделкам, %
-  byExit: { tp: number; sl: number; timeout: number }; // чем закрывались сделки
+  byExit: { tp: number; sl: number; timeout: number; converged: number }; // чем закрывались сделки
   avgMaeWin: number | null; // средняя просадка у выигравших, % — цена, которую пришлось пересидеть
+  edge: EdgeReport; // матожидание с доверительным интервалом, вердикт и флаг выключения
+}
+
+/* ---------------- Эдж и авто-отключение ---------------- */
+
+/**
+ * Чистые результаты сделок по каждому типу, в хронологическом порядке.
+ * Только разрешённые исходы: истёкшие (win == null) — это отсутствие данных, а не ноль,
+ * и включать их в матожидание нельзя ни как ноль, ни как убыток.
+ */
+function pnlSequences(): Record<PatternKind, number[]> {
+  const arr = loadSignals();
+  const out = loadOutcomes();
+  const seq = Object.fromEntries(ALL_KINDS.map((k) => [k, [] as number[]])) as Record<PatternKind, number[]>;
+  for (const s of arr) {
+    const oc = out[s.key];
+    if (!oc || oc.win == null || oc.pnlPct == null) continue;
+    seq[s.pattern]?.push(oc.pnlPct);
+  }
+  return seq;
+}
+
+/* Отчёты пересчитываются не чаще раза в 30с: бутстрэп — 2000 ресэмплов на паттерн,
+   а isPatternMuted вызывается на каждом сигнале в потоке алертов. Кэш инвалидируется
+   и по времени, и по числу записей, чтобы свежая дооценка исходов не ждала минуту. */
+const EDGE_TTL_MS = 30_000;
+let edgeCache: { ts: number; signals: number; outcomes: number; v: Record<PatternKind, EdgeReport> } | null = null;
+
+/** Отчёты по эджу всех паттернов */
+export function patternEdges(): Record<PatternKind, EdgeReport> {
+  const nSig = loadSignals().length;
+  const nOut = Object.keys(loadOutcomes()).length;
+  if (edgeCache && edgeCache.signals === nSig && edgeCache.outcomes === nOut && Date.now() - edgeCache.ts < EDGE_TTL_MS) {
+    return edgeCache.v;
+  }
+  const seq = pnlSequences();
+  const v = Object.fromEntries(ALL_KINDS.map((k) => [k, computeEdge(seq[k])])) as Record<PatternKind, EdgeReport>;
+  edgeCache = { ts: Date.now(), signals: nSig, outcomes: nOut, v };
+  return v;
+}
+
+/**
+ * Выключен ли паттерн: весь доверительный интервал матожидания лежит ниже нуля
+ * на окне последних исходов. Состояние нигде не хранится — это чистая функция от
+ * журнала, поэтому паттерн включится обратно сам, как только плохие исходы выйдут
+ * из окна. Запись сигналов продолжается и у выключенного паттерна: перестав писать,
+ * он лишился бы данных, по которым только и может реабилитироваться, — выключение
+ * убирает его из алертов, а не из измерения.
+ */
+export function isPatternMuted(kind: PatternKind): boolean {
+  return patternEdges()[kind]?.muted ?? false;
 }
 
 export function patternStats(): { stats: PatternStat[]; anyWaiting: number } {
@@ -450,8 +660,8 @@ export function patternStats(): { stats: PatternStat[]; anyWaiting: number } {
   const out = loadOutcomes();
   const now = Date.now();
   const dayAgo = now - 24 * 3600 * 1000;
-  const kinds: PatternKind[] = ['spread', 'robot', 'sweep', 'whale', 'funding'];
-  const stats: PatternStat[] = kinds.map((k) => {
+  const edges = patternEdges();
+  const stats: PatternStat[] = ALL_KINDS.map((k) => {
     const sigs = arr.filter((s) => s.pattern === k);
     const meta = PATTERN_META[k];
     let resolved = 0;
@@ -467,7 +677,11 @@ export function patternStats(): { stats: PatternStat[]; anyWaiting: number } {
     let pnlN = 0;
     let maeWinSum = 0;
     let maeWinN = 0;
-    const byExit = { tp: 0, sl: 0, timeout: 0 };
+    let grossSum = 0;
+    let grossN = 0;
+    let costSum = 0;
+    let costN = 0;
+    const byExit = { tp: 0, sl: 0, timeout: 0, converged: 0 };
     for (const s of sigs) {
       const oc = out[s.key];
       if (!oc) {
@@ -483,6 +697,14 @@ export function patternStats(): { stats: PatternStat[]; anyWaiting: number } {
       if (oc.pnlPct != null) {
         pnlSum += oc.pnlPct;
         pnlN++;
+      }
+      if (oc.pnlGrossPct != null) {
+        grossSum += oc.pnlGrossPct;
+        grossN++;
+      }
+      if (oc.costPct != null) {
+        costSum += oc.costPct;
+        costN++;
       }
       if (oc.win) {
         wins++;
@@ -515,9 +737,12 @@ export function patternStats(): { stats: PatternStat[]; anyWaiting: number } {
       avgMfeLoss: mfeLossN ? Math.round((mfeLossSum / mfeLossN) * 100) / 100 : null,
       lastTs: sigs.length ? sigs[sigs.length - 1].ts : null,
       expectancyPct: pnlN ? Math.round((pnlSum / pnlN) * 1000) / 1000 : null,
+      expectancyGrossPct: grossN ? Math.round((grossSum / grossN) * 1000) / 1000 : null,
+      avgCostPct: costN ? Math.round((costSum / costN) * 1000) / 1000 : null,
       sumPnlPct: pnlN ? Math.round(pnlSum * 1000) / 1000 : null,
       byExit,
       avgMaeWin: maeWinN ? Math.round((maeWinSum / maeWinN) * 100) / 100 : null,
+      edge: edges[k],
     };
   });
   return { stats, anyWaiting: stats.reduce((a, s) => a + s.waiting, 0) };

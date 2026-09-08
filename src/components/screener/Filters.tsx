@@ -150,6 +150,21 @@ export function Filters({
           onChange={(e) => setFilters({ search: e.target.value })}
           className="h-7 w-40 bg-zinc-900 text-xs"
         />
+        {/* Универсум — серверный отбор монет, а не фильтр строк: «топ по обороту» физически
+            не содержит неликвида (нижняя граница выдачи ~$21M за сутки). */}
+        <label className="flex items-center gap-1.5" title="Какие монеты вообще сканируются. Неликвид — полоса оборота $0.3–20M за 24ч">
+          <span className="text-zinc-500">универсум</span>
+          <select
+            value={filters.universe || 'all'}
+            onChange={(e) => setFilters({ universe: e.target.value as 'all' | 'illiquid' })}
+            className={`h-7 rounded border bg-zinc-900 px-1.5 text-xs ${
+              filters.universe === 'illiquid' ? 'border-amber-500/50 text-amber-400' : 'border-zinc-700 text-zinc-300'
+            }`}
+          >
+            <option value="all">топ по обороту</option>
+            <option value="illiquid">💧 неликвид $0.3–20M</option>
+          </select>
+        </label>
         {numInput('minTurnoverM', 'оборот ≥', '1', 'w-[68px]', 'M$')}
         {numInput('minSpread', 'спред ≥', '0.05', 'w-[68px]', '%')}
         {numInput('minNet', 'нетто ≥', '0.05', 'w-[68px]', '%')}
@@ -160,6 +175,15 @@ export function Filters({
         {numInput('minFundingSpread', 'фандΔ ≥', '0.005', 'w-[60px]', '%')}
         {numInput('minWhale', 'киты ≥', '100', 'w-[62px]', 'K$')}
         {numInput('minLiq', 'ликв ≥', '50', 'w-[58px]', 'K$')}
+        {numInput('minBreakout', 'пробой ≥', '10', 'w-[58px]')}
+        <label className="flex items-center gap-1.5" title="Только пилы: низкая эффективность хода, стопы снимают с обеих сторон. Пробои здесь чаще ложные">
+          <Switch checked={filters.onlyErsh} onCheckedChange={(v) => setFilters({ onlyErsh: v })} className="scale-90" />
+          <span className="text-zinc-500">〰 ёрш</span>
+        </label>
+        <label className="flex items-center gap-1.5" title="Только раздача/набор: поток и открытый интерес расходятся с движением цены">
+          <Switch checked={filters.onlyDist} onCheckedChange={(v) => setFilters({ onlyDist: v })} className="scale-90" />
+          <span className="text-zinc-500">📦 раздача</span>
+        </label>
         <label className="flex items-center gap-1.5">
           <Switch
             checked={filters.onlyWatchlist}

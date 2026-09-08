@@ -105,12 +105,31 @@ function cvOf(gaps: number[]): number | null {
   return Math.sqrt(varr) / mean;
 }
 
+/* Максимальное окно ленты. Биржа отдаёт последние N сделок, а не последние N минут:
+   на ликвидной монете это пара минут, на неликвидной — часы. Замеренный разброс на
+   полосе неликвида: от 105 секунд до 5.3 часа при одном и том же лимите в 1000 сделок.
+   Без обрезки агрессия, клипы и регулярность считаются по несопоставимым окнам и
+   складываются в один скор, а детектор «робот вошёл СЕЙЧАС» получает картину за
+   полдня. Сделки старше часа отбрасываются до расчёта. */
+const TAPE_MAX_WINDOW_MS = 60 * 60_000;
+/** Ниже этого числа сделок в окне лента слишком редкая, чтобы отличать робота от шума */
+export const TAPE_MIN_TRADES = 30;
+
+/* Пороги паттерна «робот вошёл в неликвид» — экспортируются, чтобы подпись в интерфейсе
+   не разошлась с правилом: описание в UI ссылается на эти же константы, а не повторяет
+   числа текстом. Разошедшаяся подпись хуже отсутствующей: она выглядит как объяснение. */
+export const ROBOT_ALGO_MIN = 50;
+export const ROBOT_ILLIQ_MIN = 50;
+
 export function analyzeTape(trades: TapeTrade[], now = Date.now()): TapeStats | null {
   if (!trades || trades.length < 10) return null;
+  const newestAll = trades[trades.length - 1].ts;
+  if (now - newestAll > 5 * 60_000) return null; // лента протухла (монета не торгуется)
+  trades = trades.filter((t) => newestAll - t.ts <= TAPE_MAX_WINDOW_MS);
+  if (trades.length < 10) return null;
   const newest = trades[trades.length - 1].ts;
   const oldest = trades[0].ts;
   const windowSec = Math.max(1, Math.round((newest - oldest) / 1000));
-  if (now - newest > 5 * 60_000) return null; // лента протухла (монета не торгуется)
 
   let buy = 0;
   let total = 0;
@@ -210,11 +229,21 @@ export function algoScoreOf(inp: AlgoInput): number {
   let reg = 0;
   let aggr = 0;
   let burst = 0;
+  /* Шкалы откалиброваны по замеренному распределению неликвидной полосы, а не по
+     ликвидному топу, на котором они настраивались изначально. Замер (80 монет полосы
+     $0.3–20M, 24 с лентой): clipRatio max 0.18 при делителе 0.5; gapCv min 0.80 при
+     пороге 0.8 — компонент регулярности выдавал ноль ВСЕГДА; tradesPerMin медиана 13
+     при делителе 150. Потолок скора выходил ~31 при воротах детектора 55, то есть
+     сработать он не мог ни при каких данных.
+
+     Регулярность привязана к 1.0, а не к наблюдаемому минимуму: CV интервалов
+     пуассоновского (случайного) потока равен единице, поэтому «механическим» является
+     всё, что заметно ниже 1.0 — это якорь из теории, а не подгонка под выборку. */
   if (t) {
-    if (t.clipCount >= 5) clips = 30 * clamp(t.clipRatio / 0.5);
-    if (t.clipCount >= 5 && t.gapCv != null) reg = 25 * clamp((0.8 - t.gapCv) / 0.6);
-    aggr = 20 * clamp(Math.abs(t.aggression) / 0.5);
-    burst = 15 * clamp(t.tradesPerMin / 150);
+    if (t.clipCount >= 5) clips = 30 * clamp(t.clipRatio / 0.2);
+    if (t.clipCount >= 5 && t.gapCv != null) reg = 25 * clamp((1.0 - t.gapCv) / 0.5);
+    aggr = 20 * clamp(Math.abs(t.aggression) / 0.4);
+    burst = 15 * logScale(t.tradesPerMin, 3, 300);
   }
   const conf =
     10 *
@@ -264,10 +293,10 @@ export function buildPattern(
   dOiPct15m: number | null
 ): { robotIlliquid: boolean; reasons: string[] } {
   const reasons: string[] = [];
-  if (tape && tape.clipCount >= 5 && tape.clipRatio >= 0.3)
+  if (tape && tape.clipCount >= 5 && tape.clipRatio >= 0.12)
     reasons.push(`клипы ${Math.round(tape.clipRatio * 100)}% объёма (~$${tape.clipUsd >= 1000 ? Math.round(tape.clipUsd / 1000) + 'K' : Math.round(tape.clipUsd)}, ×${tape.clipCount})`);
-  if (tape && tape.gapCv != null && tape.gapCv <= 0.45) reasons.push(`механический интервал (CV ${tape.gapCv})`);
-  if (tape && Math.abs(tape.aggression) >= 0.3)
+  if (tape && tape.gapCv != null && tape.gapCv <= 0.9) reasons.push(`механический интервал (CV ${tape.gapCv})`);
+  if (tape && Math.abs(tape.aggression) >= 0.25)
     reasons.push(`тейкер-агрессия ${tape.aggression > 0 ? '+' : ''}${tape.aggression.toFixed(2)}`);
   if (dOiPct15m != null && Math.abs(dOiPct15m) >= 0.4)
     reasons.push(`ΔOI ${dOiPct15m > 0 ? '+' : ''}${dOiPct15m.toFixed(2)}%/15м`);
@@ -277,7 +306,26 @@ export function buildPattern(
   if (netSpreadPct != null && netSpreadPct >= 0.15) reasons.push(`нетто ${netSpreadPct.toFixed(2)}%`);
   else if (crossSpreadPct != null && crossSpreadPct >= 0.3) reasons.push(`спред ${crossSpreadPct.toFixed(2)}%`);
 
-  const robotIlliquid = algo >= 55 && illiq >= 50 && (netSpreadPct != null && netSpreadPct >= 0.15 || (crossSpreadPct ?? 0) >= 0.3);
+  /* Ворота взяты из замеренного распределения после перекалибровки шкал: медиана алго-скора
+     на полосе неликвида — 20, q90 — 34, максимум — 60, поэтому 50 отсекает верхний хвост
+     (~5% монет с лентой). Прежнее значение 55 стояло на шкале, потолок которой был 31:
+     оно не отсекало хвост, а запрещало срабатывание вообще.
+
+     Редкая лента исключается отдельно: на двух десятках сделок «механическая
+     регулярность» неотличима от совпадения, каким бы ни был скор.
+
+     Само срабатывание ещё не означает, что паттерн зарабатывает: это решает отчёт по
+     эджу в истории паттернов (доверительный интервал матожидания), а не порог здесь. */
+  /* Межбиржевого разрыва в воротах больше нет. Замер на полосе неликвида: спред-условию
+     отвечали 2 монеты из 26, и алго-скор у них был 20 и 17 при медиане 20 — то есть
+     активность робота и межбиржевой разрыв в этой популяции не совпадают, и конъюнкция
+     не выполнялась бы ни при каком пороге. Это разные явления: разрыв — про арбитраж
+     между площадками, клипы с механическим интервалом — про то, кто работает в книге
+     здесь и сейчас. Спред остаётся среди причин (обогащает сигнал), но не блокирует его.
+     История паттерна при смене определения не портится: за всё время журнала он дал
+     ровно 1 сигнал, статистики по нему нет. */
+  const thinTape = !tape || tape.trades < TAPE_MIN_TRADES;
+  const robotIlliquid = !thinTape && algo >= ROBOT_ALGO_MIN && illiq >= ROBOT_ILLIQ_MIN;
   return { robotIlliquid, reasons };
 }
 

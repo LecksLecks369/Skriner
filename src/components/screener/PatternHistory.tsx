@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { ExchangeId } from '@/lib/screener/types';
 
-type PatternKind = 'spread' | 'robot' | 'sweep' | 'whale' | 'funding';
+type PatternKind = 'spread' | 'robot' | 'sweep' | 'whale' | 'funding' | 'breakout' | 'distribution' | 'chop';
 
 interface PatternStat {
   pattern: PatternKind;
@@ -21,11 +21,40 @@ interface PatternStat {
   avgMfeWin: number | null;
   avgMfeLoss: number | null;
   lastTs: number | null;
-  expectancyPct: number | null;
+  expectancyPct: number | null; // чистое матожидание: после издержек круга
+  expectancyGrossPct: number | null; // до издержек — разница показывает, сколько съедает круг
+  avgCostPct: number | null;
   sumPnlPct: number | null;
-  byExit: { tp: number; sl: number; timeout: number };
+  byExit: { tp: number; sl: number; timeout: number; converged: number };
   avgMaeWin: number | null;
+  edge: EdgeReport;
 }
+
+/* Отчёт по эджу: матожидание с доверительным интервалом и вердикт. Одно число без
+   интервала на выборке в десяток сделок читается как факт, хотя фактом не является,
+   поэтому в карточке показываются оба конца интервала и размер выборки. */
+interface EdgeReport {
+  n: number;
+  nTotal: number;
+  expectancyPct: number | null;
+  ciLoPct: number | null;
+  ciHiPct: number | null;
+  winRate: number | null;
+  winLoPct: number | null;
+  winHiPct: number | null;
+  profitFactor: number | null;
+  sumPnlPct: number | null;
+  verdict: 'insufficient' | 'negative' | 'inconclusive' | 'positive';
+  muted: boolean;
+  reason: string;
+}
+
+const VERDICT: Record<EdgeReport['verdict'], { label: string; cls: string }> = {
+  insufficient: { label: 'мало данных', cls: 'text-zinc-500 border-zinc-700 bg-zinc-800/50' },
+  negative: { label: 'выключен', cls: 'text-rose-400 border-rose-500/40 bg-rose-500/10' },
+  inconclusive: { label: 'не доказан', cls: 'text-amber-400 border-amber-500/30 bg-amber-500/10' },
+  positive: { label: 'эдж есть', cls: 'text-emerald-400 border-emerald-500/30 bg-emerald-500/10' },
+};
 
 interface PatternSig {
   key: string;
@@ -45,6 +74,14 @@ interface PatternSig {
   fundingPct?: number;
   wickAtr?: number;
   volMult?: number;
+  /* сетапы движения */
+  setupScore?: number;
+  level?: number;
+  distAtr?: number;
+  distKind?: string;
+  movePct?: number;
+  erThr?: number;
+  bandPct?: number; // legacy: сигналы ерша до перехода на будущий ER
   outcome?: {
     mfePct: number | null;
     maePct: number | null;
@@ -66,6 +103,9 @@ const KIND_LABEL: Record<PatternKind, { icon: string; name: string; color: strin
   sweep: { icon: '🌊', name: 'Свип', color: 'text-amber-400 border-amber-500/30 bg-amber-500/10' },
   whale: { icon: '🐋', name: 'Киты', color: 'text-cyan-400 border-cyan-500/30 bg-cyan-500/10' },
   funding: { icon: '💸', name: 'Фандинг', color: 'text-fuchsia-400 border-fuchsia-500/30 bg-fuchsia-500/10' },
+  breakout: { icon: '⚡', name: 'Пробой', color: 'text-emerald-400 border-emerald-500/30 bg-emerald-500/10' },
+  distribution: { icon: '📦', name: 'Раздача', color: 'text-rose-400 border-rose-500/30 bg-rose-500/10' },
+  chop: { icon: '〰', name: 'Ёрш', color: 'text-orange-400 border-orange-500/30 bg-orange-500/10' },
 };
 
 function metricOf(s: PatternSig): string {
@@ -83,6 +123,14 @@ function metricOf(s: PatternSig): string {
     }
     case 'funding':
       return `фандинг ${(s.fundingPct ?? 0) > 0 ? '+' : ''}${(s.fundingPct ?? 0).toFixed(3)}%`;
+    case 'breakout':
+      return `готовность ${s.setupScore ?? '—'} · до уровня ${s.distAtr ?? '—'} ATR`;
+    case 'distribution':
+      return `${s.distKind === 'pump_distribution' ? 'раздача' : 'набор'} ${s.setupScore ?? '—'} · ход ${
+        (s.movePct ?? 0) > 0 ? '+' : ''
+      }${(s.movePct ?? 0).toFixed(2)}%`;
+    case 'chop':
+      return `ёрш ${s.setupScore ?? '—'} · порог эффективности ≤ ${(s.erThr ?? 0.32).toFixed(2)}`;
   }
 }
 
@@ -126,12 +174,38 @@ export function PatternHistory() {
         {(data?.stats || []).map((st) => {
           const k = KIND_LABEL[st.pattern];
           return (
-            <div key={st.pattern} className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-3">
-              <div className="flex items-center justify-between">
+            <div
+              key={st.pattern}
+              className={`rounded-lg border bg-zinc-900/50 p-3 ${st.edge?.muted ? 'border-rose-500/30 opacity-70' : 'border-zinc-800'}`}
+            >
+              <div className="flex items-center justify-between gap-1">
                 <span className={`rounded border px-1.5 py-0.5 text-[10px] ${k.color}`}>
                   {k.icon} {st.name}
                 </span>
-                <span className="text-[10px] text-zinc-600">24ч: {st.n24h}</span>
+                {(() => {
+                  /* Паттерн-предупреждение («ёрш») сделку не предлагает, поэтому его исходы
+                     не несут P&L и матожидание для него не считается никогда. Вердикт
+                     «мало данных» здесь читался бы как «подожди ещё» — а ждать нечего:
+                     исходы есть, просто мерить в процентах нечего. */
+                  const noPnl = st.resolved > 0 && st.edge != null && st.edge.n === 0;
+                  if (noPnl) {
+                    return (
+                      <span
+                        className="rounded border border-zinc-700 bg-zinc-800/50 px-1.5 py-0.5 text-[10px] text-zinc-400"
+                        title="Сигнал-предупреждение, а не сделка: матожидание не считается — измеряется только, сбылось ли предупреждение"
+                      >
+                        без P&L
+                      </span>
+                    );
+                  }
+                  return st.edge ? (
+                    <span className={`rounded border px-1.5 py-0.5 text-[10px] ${VERDICT[st.edge.verdict].cls}`} title={st.edge.reason}>
+                      {VERDICT[st.edge.verdict].label}
+                    </span>
+                  ) : (
+                    <span className="text-[10px] text-zinc-600">24ч: {st.n24h}</span>
+                  );
+                })()}
               </div>
               <div className={`mt-2 font-mono text-2xl tabular-nums ${winRateColor(st.winRate)}`}>
                 {st.winRate != null ? `${Math.round(st.winRate * 100)}%` : '—'}
@@ -139,8 +213,44 @@ export function PatternHistory() {
               <div className="text-[10px] text-zinc-600">
                 в плюс из решённых: {st.wins} из {st.wins + st.losses}
               </div>
+              {st.edge && st.edge.expectancyPct != null && (
+                <div className="mt-1.5 rounded border border-zinc-800/80 bg-zinc-950/40 p-1.5 text-[10px] tabular-nums">
+                  <div className="flex items-baseline justify-between gap-1">
+                    <span className="text-zinc-500">эдж на сделку</span>
+                    <span className={st.edge.expectancyPct > 0 ? 'font-medium text-emerald-400' : 'font-medium text-rose-400'}>
+                      {st.edge.expectancyPct > 0 ? '+' : ''}
+                      {st.edge.expectancyPct.toFixed(3)}%
+                    </span>
+                  </div>
+                  {st.edge.ciLoPct != null && st.edge.ciHiPct != null && (
+                    <div className="mt-0.5 flex items-baseline justify-between gap-1 text-zinc-600">
+                      <span>95% интервал</span>
+                      <span>
+                        [{st.edge.ciLoPct > 0 ? '+' : ''}
+                        {st.edge.ciLoPct.toFixed(3)}; {st.edge.ciHiPct > 0 ? '+' : ''}
+                        {st.edge.ciHiPct.toFixed(3)}]
+                      </span>
+                    </div>
+                  )}
+                  <div className="mt-0.5 flex items-baseline justify-between gap-1 text-zinc-600">
+                    <span>выборка</span>
+                    <span>
+                      n={st.edge.n}
+                      {st.edge.nTotal > st.edge.n && ` из ${st.edge.nTotal}`}
+                      {st.edge.profitFactor != null && ` · PF ${st.edge.profitFactor.toFixed(2)}`}
+                    </span>
+                  </div>
+                  <div className="mt-1 leading-snug text-zinc-600">{st.edge.reason}</div>
+                  {st.edge.muted && (
+                    <div className="mt-1 leading-snug text-rose-400/90">
+                      алерты этого типа выключены; сигналы продолжают писаться в историю — тип включится сам, когда убыточные исходы выйдут из окна
+                    </div>
+                  )}
+                </div>
+              )}
               <div className="mt-1.5 flex flex-wrap gap-x-2 text-[10px] text-zinc-500">
                 <span>всего: {st.total}</span>
+                <span>24ч: {st.n24h}</span>
                 {st.waiting > 0 && <span className="text-zinc-400">ждут: {st.waiting}</span>}
                 {st.expired > 0 && <span>истекло: {st.expired}</span>}
               </div>
@@ -151,8 +261,15 @@ export function PatternHistory() {
                     {st.expectancyPct > 0 ? '+' : ''}
                     {st.expectancyPct.toFixed(3)}%
                   </span>
+                  {st.avgCostPct != null && st.expectancyGrossPct != null && (
+                    <span className="text-zinc-600" title="результат до вычета издержек и стоимость круга">
+                      ({st.expectancyGrossPct > 0 ? '+' : ''}
+                      {st.expectancyGrossPct.toFixed(3)}% − круг {st.avgCostPct.toFixed(3)}%)
+                    </span>
+                  )}
                   <span className="text-zinc-600">
-                    тейк {st.byExit.tp} / стоп {st.byExit.sl} / время {st.byExit.timeout}
+                    тейк {st.byExit.tp} / стоп {st.byExit.sl}
+                    {st.byExit.converged > 0 && <> / сошёлся {st.byExit.converged}</>} / время {st.byExit.timeout}
                   </span>
                 </div>
               )}

@@ -44,6 +44,10 @@ export function filterAndSort(
     if (filters.minFundingSpread > 0 && (r.fundingSpreadPct ?? 0) < filters.minFundingSpread) return false;
     if (filters.minWhale > 0 && Math.abs(r.whaleNetUsd ?? 0) < filters.minWhale * 1000) return false;
     if (filters.minLiq > 0 && (r.liq15mUsd ?? 0) < filters.minLiq * 1000) return false;
+    // пробой фильтруем только «до уровня»: вышедшая за уровень цена — уже не прогноз
+    if (filters.minBreakout > 0 && !(r.breakout && !r.breakout.fired && r.breakout.score >= filters.minBreakout)) return false;
+    if (filters.onlyErsh && !r.chop?.isErsh) return false;
+    if (filters.onlyDist && !r.dist?.dir) return false;
     if (filters.onlyWatchlist && !watchlist.includes(r.symbol)) return false;
     if (filters.exchanges.length) {
       const ids = r.exchanges.map((x) => x.exchange);
@@ -109,6 +113,12 @@ function getSortVal(r: CoinRow, key: string, threshold: number): number | string
       return r.deep?.algoScore ?? r.algoProxy;
     case 'illiq':
       return r.deep?.illiqScore ?? r.illiqProxy;
+    case 'breakout':
+      return r.breakout && !r.breakout.fired ? r.breakout.score : null;
+    case 'chop':
+      return r.chop?.score ?? null;
+    case 'dist':
+      return r.dist?.dir ? r.dist.score : null;
     case 'coverage':
       return r.coverage;
     default:
@@ -120,6 +130,9 @@ const COLS: Array<{ key: string; label: string; title: string; cls?: string }> =
   { key: 'symbol', label: 'Монета', title: 'Символ + покрытие биржами' },
   { key: 'price', label: 'Цена', title: 'Медианная цена', cls: 'hidden lg:table-cell' },
   { key: 'score', label: 'Скор', title: 'Композитный скор 0–100 (волатильность, OI, свипы, спред, мультибиржевость, фандинг)' },
+  { key: 'breakout', label: 'Пробой', title: 'Готовность к пробою 0–100: сжатие волатильности + прижатие к границе диапазона + набор OI + агрессия в сторону выхода. Стрелка — сторона уровня. Показывается ДО выхода за уровень; после выхода — прочерк' },
+  { key: 'chop', label: 'Ёрш', title: 'Пила: низкий коэффициент эффективности, свечи с длинными тенями, стопы снимают с обеих сторон. В такой монете пробои чаще ложные — сигнал пробоя штрафуется' },
+  { key: 'dist', label: 'Раздача', title: 'Расхождение потока и цены внутри пампа/дампа: рост на падающем OI, продажи в рост, толпа набилась в ту же сторону. Контр-сигнал против движения' },
   { key: 'spread', label: 'Спред', title: 'Межбиржевой спред (max-min)/mid' },
   { key: 'net', label: 'Нетто', title: 'Спред после taker-комиссий обеих бирж — торгуемый разрыв' },
   { key: 'z', label: 'Z', title: 'Z-score спреда против его собственной истории' },
@@ -243,6 +256,32 @@ export function TableView({
                           SWEEP
                         </span>
                       )}
+                      {r.breakout && !r.breakout.fired && r.breakout.score >= 60 && (
+                        <span
+                          title={`Готовится пробой ${r.breakout.dir === 'up' ? 'вверх' : 'вниз'}: ${r.breakout.reasons.join(' · ')}`}
+                          className="rounded bg-emerald-500/15 px-1 text-[10px] font-semibold text-emerald-400"
+                        >
+                          ПРОБОЙ {r.breakout.dir === 'up' ? '↑' : '↓'}
+                        </span>
+                      )}
+                      {r.chop?.isErsh && (
+                        <span
+                          title={`Ёрш: пила, ложные пробои (эффективность ${r.chop.er})`}
+                          className="rounded bg-orange-500/15 px-1 text-[10px] font-semibold text-orange-400"
+                        >
+                          ЁРШ
+                        </span>
+                      )}
+                      {r.dist?.dir && (
+                        <span
+                          title={`${r.dist.kind === 'pump_distribution' ? 'Раздача в памп' : 'Набор в дамп'}: ${r.dist.reasons.join(' · ')}`}
+                          className={`rounded px-1 text-[10px] font-semibold ${
+                            r.dist.kind === 'pump_distribution' ? 'bg-rose-500/15 text-rose-400' : 'bg-emerald-500/15 text-emerald-400'
+                          }`}
+                        >
+                          {r.dist.kind === 'pump_distribution' ? 'РАЗДАЧА' : 'НАБОР'}
+                        </span>
+                      )}
                     </div>
                   </td>
                   <td className={`px-2 py-1.5 font-mono tabular-nums text-zinc-300 ${cell(fmtPrice(r.price))} hidden lg:table-cell`}>
@@ -250,6 +289,55 @@ export function TableView({
                   </td>
                   <td className="px-2 py-1.5">
                     <ScorePill score={r.score} />
+                  </td>
+                  <td className="px-2 py-1.5">
+                    {r.breakout && !r.breakout.fired ? (
+                      <span
+                        title={`${r.breakout.reasons.join(' · ')} · уровень ${fmtPrice(r.breakout.level)} · диапазон ${r.breakout.rangePct}% · тестов ${r.breakout.touches}`}
+                        className={`font-mono text-xs tabular-nums ${
+                          r.breakout.score >= 60 ? 'font-semibold text-emerald-400' : r.breakout.score >= 40 ? 'text-lime-400' : 'text-zinc-500'
+                        }`}
+                      >
+                        {r.breakout.dir === 'up' ? '↑' : '↓'}
+                        {r.breakout.score}
+                      </span>
+                    ) : (
+                      <span className="text-zinc-700" title={r.breakout?.fired ? 'цена уже вышла за уровень — не прогноз' : 'нет диапазона для уровня'}>
+                        —
+                      </span>
+                    )}
+                  </td>
+                  <td className="px-2 py-1.5">
+                    {r.chop ? (
+                      <span
+                        title={`эффективность ${r.chop.er} · смены направления ${r.chop.flips} · тени ${Math.round(r.chop.wickRatio * 100)}%${r.chop.bothSides ? ' · стопы снимали с обеих сторон' : ''}`}
+                        className={`font-mono text-xs tabular-nums ${
+                          r.chop.isErsh ? 'font-semibold text-orange-400' : r.chop.score >= 40 ? 'text-amber-400/70' : 'text-zinc-500'
+                        }`}
+                      >
+                        {r.chop.score}
+                      </span>
+                    ) : (
+                      <span className="text-zinc-700">—</span>
+                    )}
+                  </td>
+                  <td className="px-2 py-1.5">
+                    {r.dist?.dir ? (
+                      <span
+                        title={r.dist.reasons.join(' · ')}
+                        className={`rounded px-1 text-[10px] font-semibold ${
+                          r.dist.kind === 'pump_distribution' ? 'bg-rose-500/15 text-rose-400' : 'bg-emerald-500/15 text-emerald-400'
+                        }`}
+                      >
+                        {r.dist.kind === 'pump_distribution' ? 'РАЗДАЧА' : 'НАБОР'} {r.dist.score}
+                      </span>
+                    ) : r.dist ? (
+                      <span className="text-[10px] text-zinc-600" title={r.dist.reasons.join(' · ')}>
+                        тренд
+                      </span>
+                    ) : (
+                      <span className="text-zinc-700">—</span>
+                    )}
                   </td>
                   <td className={`px-2 py-1.5 font-mono tabular-nums ${spreadColor(r.crossSpreadPct, threshold)}`}>
                     {fmtPct(r.crossSpreadPct)}
@@ -421,6 +509,9 @@ export function TableView({
                 {r.whaleNetUsd != null && Math.abs(r.whaleNetUsd) >= 100_000 && (
                   <span className={r.whaleNetUsd > 0 ? 'text-emerald-500' : 'text-rose-500'}>🐋 </span>
                 )}
+                {r.breakout && !r.breakout.fired && r.breakout.score >= 60 && <span title={`Готовится пробой ${r.breakout.dir === 'up' ? 'вверх' : 'вниз'}`}>⚡ </span>}
+                {r.chop?.isErsh && <span title="Ёрш: ложные пробои">〰 </span>}
+                {r.dist?.dir && <span title={r.dist.kind === 'pump_distribution' ? 'Раздача в памп' : 'Набор в дамп'}>📦 </span>}
                 {(r.deep?.algoScore ?? r.algoProxy ?? 0) >= 55 && <span title="Алго-всплеск">🤖 </span>}
                 {(r.deep?.illiqScore ?? r.illiqProxy ?? 0) >= 55 && <span title="Неликвид">💧 </span>}
                 {fmtTurnover(r.turnoverUsd)} · {fmtAge(r.spreadAgeMin)}

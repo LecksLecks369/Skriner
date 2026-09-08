@@ -4,12 +4,17 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { CoinRow, PaperTrade, ScanResponse } from '@/lib/screener/types';
 import { EX_MAP } from './format';
 import { netSpreadForPair } from '@/lib/screener/pair';
+import { arbCostPct, arbPnlPct } from '@/lib/screener/costs';
 import { Button } from '@/components/ui/button';
 import { toast } from '@/hooks/use-toast';
 
-/* Панель paper-трейдинга: список сделок, статистика, авто-закрытие TP/SL по текущему скану.
-   TP: нетто сжалось до max(0.05%, 35% от входа) — спред сошёлся.
-   SL: нетто выросло ещё на 0.25% и более — разрыв расширился против нас. */
+/* Панель paper-трейдинга: список сделок, статистика, авто-закрытие по текущему скану.
+   TP: P&L после издержек круга дошёл до цели — единственный выход, который считается прибылью.
+   «сошёлся»: разрыв сжался до max(0.05%, 35% от входа), но прибыли нет — эджа не осталось.
+   SL: нетто выросло ещё на 0.25% и более — разрыв расширился против нас.
+
+   P&L открытой сделки показывается тоже за вычетом издержек: раньше здесь стояло
+   netEntry − live, и открытая позиция выглядела прибыльной ровно на стоимость круга. */
 
 interface PaperStats {
   open: number;
@@ -21,6 +26,15 @@ interface PaperStats {
 }
 
 interface Analytics {
+  /* Матожидание с интервалом: то же, что в карточках паттернов — вердикт по положению нуля */
+  edge?: {
+    n: number;
+    expectancyPct: number | null;
+    ciLoPct: number | null;
+    ciHiPct: number | null;
+    verdict: 'insufficient' | 'negative' | 'inconclusive' | 'positive';
+    reason: string;
+  };
   profitFactor: number | null;
   expectancy: number | null;
   avgWin: number | null;
@@ -179,6 +193,11 @@ export function PaperPanel({ scan }: { scan: ScanResponse | null }) {
             <div className={`font-mono text-lg tabular-nums ${(analytics.expectancy ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
               {analytics.expectancy != null ? `${analytics.expectancy >= 0 ? '+' : ''}${analytics.expectancy.toFixed(3)}%` : '—'}
             </div>
+            {analytics.edge?.ciLoPct != null && analytics.edge.ciHiPct != null && (
+              <div className="mt-0.5 font-mono text-[10px] tabular-nums text-zinc-600" title={analytics.edge.reason}>
+                95% [{analytics.edge.ciLoPct.toFixed(3)}; {analytics.edge.ciHiPct.toFixed(3)}] · n={analytics.edge.n}
+              </div>
+            )}
           </div>
           <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-2">
             <div className="text-[10px] uppercase text-zinc-600" title="Макс просадка кривой капитала">макс. просадка</div>
@@ -202,7 +221,12 @@ export function PaperPanel({ scan }: { scan: ScanResponse | null }) {
               <div className="flex justify-between border-t border-zinc-800 pt-1">
                 <span>по выходам</span>
                 <b className="font-mono tabular-nums text-zinc-300">
-                  {Object.entries(analytics.byReason).map(([k, v]) => `${k === 'tp' ? 'TP' : k === 'sl' ? 'SL' : k === 'timeout' ? 'таймаут' : 'вручн'}: ${v.n} (${v.pnl >= 0 ? '+' : ''}${v.pnl.toFixed(1)}%)`).join(' · ')}
+                  {Object.entries(analytics.byReason)
+                    .map(
+                      ([k, v]) =>
+                        `${k === 'tp' ? 'TP' : k === 'sl' ? 'SL' : k === 'converged' ? 'сошёлся' : k === 'timeout' ? 'таймаут' : 'вручн'}: ${v.n} (${v.pnl >= 0 ? '+' : ''}${v.pnl.toFixed(1)}%)`
+                    )
+                    .join(' · ')}
                 </b>
               </div>
             )}
@@ -238,7 +262,12 @@ export function PaperPanel({ scan }: { scan: ScanResponse | null }) {
               const row = rowsRef.current.get(t.symbol);
               const live = row ? netSpreadForPair(row, t.buyEx, t.sellEx) : null;
               const cur = t.status === 'open' ? live : t.netExit;
-              const pnl = t.status === 'closed' ? t.pnlPct : live != null ? t.netEntry - live : null;
+              const pnl =
+                t.status === 'closed'
+                  ? t.pnlPct
+                  : live != null
+                    ? arbPnlPct(t.netEntry, live, arbCostPct(t.buyEx, t.sellEx, t.slipRoundTripPct ?? null))
+                    : null;
               return (
                 <tr key={t.id} className="border-b border-zinc-900/70">
                   <td className="px-3 py-1.5 tabular-nums text-zinc-500">
@@ -262,7 +291,15 @@ export function PaperPanel({ scan }: { scan: ScanResponse | null }) {
                       </button>
                     ) : (
                       <span className={t.closeReason === 'tp' ? 'text-emerald-400' : t.closeReason === 'sl' ? 'text-rose-400' : 'text-zinc-500'}>
-                        {t.closeReason === 'tp' ? 'TP' : t.closeReason === 'sl' ? 'SL' : t.closeReason === 'timeout' ? 'таймаут' : 'вручную'}
+                        {t.closeReason === 'tp'
+                          ? 'TP'
+                          : t.closeReason === 'sl'
+                            ? 'SL'
+                            : t.closeReason === 'converged'
+                              ? 'сошёлся'
+                              : t.closeReason === 'timeout'
+                                ? 'таймаут'
+                                : 'вручную'}
                       </span>
                     )}
                   </td>

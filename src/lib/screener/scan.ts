@@ -11,6 +11,7 @@ import {
 } from './types';
 import { fetchKlines, fetchTickers, pMap, fetchBingxPremium, fetchBingxOI, fetchBingxTaker, fetchOkxFunding, fetchOkxOI, fetchBitgetOI, fetchSpotPrices, fetchWhaleTrades, fetchOrderbook, fetchTape, fetchOkxLiquidations, fetchLsr, fetchFundingIntervals, normalizeFunding, type Book, type SpotMap, type TapeTrade, type WhaleInfo, type LiqInfo, type LsrInfo, type FundingIntervals } from './exchanges';
 import { computeScore, detectSweep, execSpreadPct, natrPct, volumeZ, cvdProxy, btcCorr } from './score';
+import { detectBreakout, detectChop, detectDistribution, CHOP_ER_MAX } from './setups';
 import { amihudPct, algoProxyOf, analyzeBook, analyzeTape, assembleDeep, illiqProxyOf } from './liquidity';
 import { seriesStore, appendJournal, journalSummary, appendSnapshot, symbolReputation, warmupSeries, scheduleSeriesPersist } from './store';
 import { appendPattern, resolvePending } from './patterns';
@@ -26,6 +27,10 @@ const OI_TTL = 180_000;
 const FUNDING_TTL = 300_000;
 const OI_HISTORY_TTL = 300_000;
 const JOURNAL_THRESHOLD = 0.25; // % — порог для записи в журнал
+/* Готовность к пробою, с которой сигнал считается состоявшимся: один порог и для
+   записи в историю паттернов, и для SSE-алерта. Разные пороги означали бы, что
+   win-rate во вкладке «История» посчитан не по тем сигналам, которые приходят в алертах. */
+export const BREAKOUT_ALERT = 60;
 const JOURNAL_COOLDOWN = 10 * 60 * 1000;
 
 interface CacheGlobal {
@@ -43,7 +48,8 @@ interface CacheGlobal {
     tapes: Map<string, { ts: number; v: TapeTrade[] | null }>;
     liq: Map<string, { ts: number; v: LiqInfo | null }>;
     lsr: Map<string, { ts: number; v: LsrInfo | null }>;
-    scan: { ts: number; top: number; resp: ScanResponse } | null;
+    scan: { ts: number; top: number; resp: ScanResponse } | null; // legacy-слот, живёт в globalThis после HMR
+    scans: Map<string, { ts: number; resp: ScanResponse }>; // ключ: top + полоса оборота
   };
 }
 const g = globalThis as unknown as CacheGlobal;
@@ -63,6 +69,7 @@ if (!g.__screenerScan) {
     liq: new Map(),
     lsr: new Map(),
     scan: null,
+    scans: new Map(),
   };
 }
 const cache = g.__screenerScan;
@@ -78,6 +85,7 @@ if (cache.oi === undefined) cache.oi = new Map();
 if (cache.funding === undefined) cache.funding = new Map();
 if (cache.klines === undefined) cache.klines = new Map();
 if (cache.oiHistory === undefined) cache.oiHistory = new Map();
+if (!(cache.scans instanceof Map)) cache.scans = new Map();
 
 function mapLimitKey<T>(key: string, map: Map<string, { ts: number; v: T }>, ttl: number, fn: () => Promise<T>): Promise<T> {
   const hit = map.get(key);
@@ -189,7 +197,131 @@ async function getWhale(native: string): Promise<WhaleInfo | null> {
   return v;
 }
 
-async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promise<ScanResponse> {
+/* ---------------- Универсум сканирования ----------------
+
+   До этого универсум был жёстко «топ-N по обороту», и вся дальнейшая логика — скор,
+   стакан, паттерны, неликвид-раздел — работала по 80 САМЫМ ЛИКВИДНЫМ монетам рынка.
+   На живом скане минимальный оборот в выдаче был $21M за сутки: неликвида там нет
+   по построению, а illiqProxy мерил «наименее ликвидную из очень ликвидных».
+   Полоса оборота делает выбор явным: снизу отсекаются мёртвые книги, сверху —
+   массовые монеты, где неэффективность вычищена. */
+export interface Universe {
+  minTurnoverUsd: number;
+  maxTurnoverUsd: number;
+  /** Как выбираются N монет из полосы: 'top' — самые оборотистые, 'stratified' — вся полоса */
+  sampling?: 'top' | 'stratified';
+}
+
+export const UNIVERSE_ALL: Universe = { minTurnoverUsd: 0, maxTurnoverUsd: Number.MAX_SAFE_INTEGER, sampling: 'top' };
+/** Полоса неликвида по умолчанию: $0.3M–$20M за 24ч, с равномерным покрытием всей полосы */
+export const UNIVERSE_ILLIQUID: Universe = { minTurnoverUsd: 300_000, maxTurnoverUsd: 20_000_000, sampling: 'stratified' };
+
+/** Число слоёв при stratified-отборе: 80 мест / 8 слоёв = по 10 монет на порядок оборота */
+const STRATA = 8;
+
+/**
+ * Отбор монет из полосы.
+ *
+ * 'top' — как раньше: N самых оборотистых. Для общего универсума это и нужно.
+ *
+ * 'stratified' — полоса делится на слои, равные по ЛОГАРИФМУ оборота, и из каждого
+ * берётся своя квота. Без этого фильтр полосы не даёт того, ради чего он ставился:
+ * ранжирование по обороту внутри полосы возвращает её верхний край, и на полосе
+ * $0.3–20M выдача начиналась с $7M — нижние три четверти диапазона не появлялись
+ * вовсе. Логарифм, а не линейная шкала: между $0.3M и $3M разница в поведении книги
+ * больше, чем между $10M и $20M, а линейные слои сложили бы весь этот участок в один.
+ * Внутри слоя порядок по обороту убыванием — при нехватке данных первыми выпадают
+ * самые тонкие монеты слоя, а не случайные.
+ */
+/* Одинаковый нормализованный тикер на разных биржах не гарантирует один и тот же
+   инструмент: встречаются разный базовый актив под тем же именем и разный множитель
+   контракта (X против 1000X). Цены тогда расходятся в разы, и разрыв выглядит как
+   гигантский арбитраж: на живом скане ON котировался по $71.17 на OKX и по $0.1957
+   на MEXC — «нетто-спред 36266%», который уходил в журнал, в историю паттернов и в
+   бумажные сделки. Настоящий межбиржевой разрыв перпетуала — доли процента, поэтому
+   расхождение в разы означает не неэффективность, а разные инструменты.
+
+   Порог с большим запасом над любым реальным спредом: всё, что дальше, отбрасывается
+   вместе со всеми данными этой биржи по монете — её клайны, OI и фандинг относятся к
+   другому контракту и в строке не участвуют. На топе по обороту это почти не
+   встречалось, в полосе неликвида нашлось сразу на первом же скане. */
+const VENUE_PRICE_TOLERANCE = 0.10;
+
+function dropMismatchedVenues(agg: Map<string, { symbol: string; per: Map<ExchangeId, { price: number; turnover: number }> }>) {
+  let dropped = 0;
+  const examples: string[] = [];
+  for (const a of agg.values()) {
+    if (a.per.size < 2) continue;
+    const entries = [...a.per.entries()].filter(([, p]) => p.price > 0).sort((x, y) => x[1].price - y[1].price);
+    if (entries.length < 2) continue;
+
+    /* Кластеризация по цене, а не отбор по медиане: при расколе 2×2 (две биржи по $71,
+       две по $0.19) медиана падает между кластерами и объявляет чужими ВСЕ четыре,
+       уничтожая и тот спред, который был настоящим. Соседние по цене биржи, стоящие
+       ближе допуска, — один инструмент; выигрывает кластер с наибольшим оборотом. */
+    const clusters: (typeof entries)[] = [[entries[0]]];
+    for (let i = 1; i < entries.length; i++) {
+      const prev = entries[i - 1][1].price;
+      if (entries[i][1].price / prev - 1 > VENUE_PRICE_TOLERANCE) clusters.push([entries[i]]);
+      else clusters[clusters.length - 1].push(entries[i]);
+    }
+    if (clusters.length === 1) continue;
+
+    const turnoverOf = (c: typeof entries) => c.reduce((s, [, p]) => s + (p.turnover || 0), 0);
+    const winner = clusters.slice().sort((x, y) => turnoverOf(y) - turnoverOf(x))[0];
+    for (const [ex] of entries) {
+      if (!winner.some(([wx]) => wx === ex)) {
+        a.per.delete(ex);
+        dropped++;
+      }
+    }
+    if (examples.length < 5) examples.push(a.symbol);
+  }
+  if (dropped) {
+    console.warn(`[scan] отброшено котировок другого инструмента: ${dropped} (${examples.join(', ')})`);
+  }
+}
+
+function selectUniverse<T extends { maxTurnover: number }>(candidates: T[], top: number, uni: Universe): T[] {
+  const sorted = [...candidates].sort((x, y) => y.maxTurnover - x.maxTurnover);
+  if (uni.sampling !== 'stratified' || sorted.length <= top) return sorted.slice(0, top);
+
+  const lo = Math.log10(Math.max(1, Math.min(...sorted.map((x) => x.maxTurnover))));
+  const hi = Math.log10(Math.max(1, Math.max(...sorted.map((x) => x.maxTurnover))));
+  if (!(hi > lo)) return sorted.slice(0, top);
+
+  const buckets: T[][] = Array.from({ length: STRATA }, () => []);
+  for (const c of sorted) {
+    const pos = (Math.log10(Math.max(1, c.maxTurnover)) - lo) / (hi - lo);
+    buckets[Math.min(STRATA - 1, Math.floor(pos * STRATA))].push(c);
+  }
+
+  /* Квота на слой, но пустые и неполные слои не должны съедать места: сначала берём
+     по квоте, затем добираем остаток по обороту убыванием. */
+  const quota = Math.ceil(top / STRATA);
+  const picked: T[] = [];
+  const taken = new Set<T>();
+  for (const b of buckets) {
+    for (const c of b.slice(0, quota)) {
+      picked.push(c);
+      taken.add(c);
+    }
+  }
+  for (const c of sorted) {
+    if (picked.length >= top) break;
+    if (!taken.has(c)) {
+      picked.push(c);
+      taken.add(c);
+    }
+  }
+  return picked.slice(0, top);
+}
+
+/** Сколько мест в deep-блоке (стакан + лента) резервируется под самые неликвидные монеты */
+const DEEP_TARGETS = 40;
+const DEEP_ILLIQ_QUOTA = 10;
+
+async function doScan(top: number, refExchangePref: ExchangeId | 'auto', uni: Universe = UNIVERSE_ALL): Promise<ScanResponse> {
   warmupSeries(); // прогрев: восстановить серии с диска до первых записей
   const now = Date.now();
   const [tickers, fundingIntervals] = await Promise.all([getTickers(), getFundingIntervals()]);
@@ -223,11 +355,14 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
     }
   }
 
-  // 2. Топ по максимальному обороту
-  const ranked = [...agg.values()]
+  // 1b. Отсев бирж, торгующих под этим тикером другой инструмент
+  dropMismatchedVenues(agg);
+
+  // 2. Полоса оборота, затем отбор внутри неё (см. selectUniverse)
+  const inBand = [...agg.values()]
     .map((a) => ({ a, maxTurnover: Math.max(...[...a.per.values()].map((p) => p.turnover)) }))
-    .sort((x, y) => y.maxTurnover - x.maxTurnover)
-    .slice(0, top);
+    .filter((x) => x.maxTurnover >= uni.minTurnoverUsd && x.maxTurnover <= uni.maxTurnoverUsd);
+  const ranked = selectUniverse(inBand, top, uni);
 
   // 3. Клайны + BingX extras
   type Extra = {
@@ -319,6 +454,8 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
   const feeById = Object.fromEntries(EXCHANGES.map((e) => [e.id, e.takerFee])) as Record<ExchangeId, number>;
   const rows: CoinRow[] = [];
   const amihudBySym = new Map<string, number | null>();
+  // свечи, по которым считались сетапы: нужны для пересчёта после ленты и ликвидаций
+  const bestKlBySym = new Map<string, KlinesResult>();
 
   for (const { a } of ranked) {
     const prices = [...a.per.values()].map((p) => p.price).sort((x, y) => x - y);
@@ -506,6 +643,38 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
     const illiqProxyV = illiqProxyOf(amihudV, turnoverMax, crossSpreadPct);
     const algoProxyV = algoProxyOf(volZMax, dOi15, sweepBest?.ageMin ?? null);
 
+    /* Сетапы движения. Порядок важен: ёрш считается первым, потому что он входит
+       в готовность пробоя штрафом — в пиле граница диапазона протыкается постоянно.
+       Лента, ликвидации и L/S сюда ещё не пришли (блоки 5a/5b), поэтому те же
+       детекторы пересчитываются ниже для монет, у которых эти данные появятся. */
+    if (bestKl) bestKlBySym.set(a.symbol, bestKl);
+    const fundingSignedV = fundingVals.length
+      ? fundingVals.reduce((x, y) => (Math.abs(y) > Math.abs(x) ? y : x), 0)
+      : null;
+    const flowV = cvd ?? cvdProxyV;
+    const chopV = bestKl ? detectChop(bestKl.candles, null) : null;
+    const breakoutV = bestKl
+      ? detectBreakout(bestKl.candles, {
+          volZ: volZMax,
+          dOiPct15m: dOi15,
+          cvd: flowV,
+          chopScore: chopV?.score ?? 0,
+        })
+      : null;
+    const distV = bestKl
+      ? detectDistribution(bestKl.candles, {
+          natrPct: natrMax,
+          dOiPct15m: dOi15,
+          cvd: flowV,
+          tape: null,
+          whaleNetUsd: wh?.netUsd ?? null,
+          lsrLongPct: null,
+          fundingSigned: fundingSignedV,
+          liqLongUsd: null,
+          liqShortUsd: null,
+        })
+      : null;
+
     seriesStore.trackSignalAge(a.symbol, now, JOURNAL_THRESHOLD, netSpreadPct);
     const age = seriesStore.signalAge(a.symbol, now);
 
@@ -548,6 +717,9 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
       whaleNetUsd: wh?.netUsd ?? null,
       whaleCount: wh?.count ?? null,
       rep: repEntry,
+      breakout: breakoutV,
+      chop: chopV,
+      dist: distV,
       illiqProxy: illiqProxyV,
       algoProxy: algoProxyV,
       liq5mUsd: null,
@@ -649,9 +821,20 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
   // монеты, выпавшие из топа, больше не наблюдаются — снимаем их метки возраста сигнала
   seriesStore.dropSignalAgesExcept(new Set(rows.map((r) => r.symbol)));
 
-  // 5a. НЕЛИКВИД: deep-блок (стакан + лента) для топ-40 по скору
+  /* 5a. НЕЛИКВИД: deep-блок (стакан + лента).
+     Отбор только по скору оставлял самые неликвидные монеты вовсе без стакана: скор
+     неликвидность не учитывает, а без книги у монеты нет ни слипейджа, ни maxPos, ни
+     ленты — то есть ровно тех величин, ради которых неликвид и смотрят. Поэтому часть
+     мест резервируется под верх по illiqProxy. */
   const aggBySym = new Map(ranked.map((x) => [x.a.symbol, x.a]));
-  const deepTargets = [...rows].sort((x, y) => y.score - x.score).slice(0, 40);
+  const deepTargets = [...rows].sort((x, y) => y.score - x.score).slice(0, DEEP_TARGETS - DEEP_ILLIQ_QUOTA);
+  const deepChosen = new Set(deepTargets.map((r) => r.symbol));
+  for (const r of [...rows].sort((x, y) => (y.illiqProxy ?? 0) - (x.illiqProxy ?? 0))) {
+    if (deepTargets.length >= DEEP_TARGETS) break;
+    if (deepChosen.has(r.symbol)) continue;
+    deepChosen.add(r.symbol);
+    deepTargets.push(r);
+  }
   await pMap(
     deepTargets,
     async (r) => {
@@ -740,9 +923,9 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
      слипейдж и исполнимый спред, а без них симулятор торговал бы спредом с верха книги. */
   try {
     const ap = autoPaper(rows);
-    if (ap.opened || ap.closed.tp || ap.closed.sl || ap.closed.timeout) {
+    if (ap.opened || ap.closed.tp || ap.closed.sl || ap.closed.timeout || ap.closed.converged) {
       console.log(
-        `[paper] открыто ${ap.opened}, закрыто: TP ${ap.closed.tp} / SL ${ap.closed.sl} / таймаут ${ap.closed.timeout}`
+        `[paper] открыто ${ap.opened}, закрыто: TP ${ap.closed.tp} / SL ${ap.closed.sl} / сошлось без прибыли ${ap.closed.converged} / таймаут ${ap.closed.timeout}`
       );
     }
   } catch (e) {
@@ -794,6 +977,96 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
     },
     6
   );
+
+  /* 5b-bis. СЕТАПЫ ДВИЖЕНИЯ: пересчёт с лентой, ликвидациями и позицией розницы,
+     затем запись в историю паттернов. Раньше этого места нельзя: тейкерская агрессия
+     приходит только с deep-блоком (5a), а ликвидации и L/S — из 5b. Пишем в историю
+     только то, что является прогнозом: пробой ДО выхода за уровень, раздачу с
+     подтверждённым расхождением потока и цены, ёрш как предупреждение о ложных пробоях. */
+  for (const r of rows) {
+    const kl = bestKlBySym.get(r.symbol);
+    if (!kl) continue;
+    const a = aggBySym.get(r.symbol);
+    const tape = r.deep?.tape ?? null;
+    const flow = r.cvdTaker ?? r.cvdProxy;
+
+    if (tape) {
+      const chop2 = detectChop(kl.candles, tape);
+      if (chop2) r.chop = chop2;
+    }
+    // фандинг со знаком, приведённый к 8ч: у раздачи важно, какая сторона платит
+    const fundSigned = r.exchanges
+      .map((x) => normalizeFunding(x.fundingRate, x.fundingIntervalMin))
+      .filter((v): v is number => v != null)
+      .reduce<number | null>((acc, v) => (acc == null || Math.abs(v) > Math.abs(acc) ? v : acc), null);
+    r.dist = detectDistribution(kl.candles, {
+      natrPct: r.natrPctMax,
+      dOiPct15m: r.dOiPct15m,
+      cvd: flow,
+      tape,
+      whaleNetUsd: r.whaleNetUsd,
+      lsrLongPct: r.lsrLongPct,
+      fundingSigned: fundSigned,
+      liqLongUsd: r.liqLongUsd,
+      liqShortUsd: r.liqShortUsd,
+    });
+    if (tape) {
+      r.breakout = detectBreakout(kl.candles, {
+        volZ: r.volZMax,
+        dOiPct15m: r.dOiPct15m,
+        cvd: flow,
+        chopScore: r.chop?.score ?? 0,
+      });
+    }
+
+    if (!a) continue;
+    const bestP = [...a.per.entries()].sort((x, y) => y[1].turnover - x[1].turnover)[0];
+
+    if (r.breakout && !r.breakout.fired && r.breakout.score >= BREAKOUT_ALERT) {
+      appendPattern({
+        ts: now,
+        symbol: r.symbol,
+        pattern: 'breakout',
+        dir: r.breakout.dir === 'up' ? 'long' : 'short',
+        price: r.price,
+        ex: bestP[0],
+        native: bestP[1].native,
+        score: r.score,
+        setupScore: r.breakout.score,
+        level: r.breakout.level,
+        distAtr: r.breakout.distAtr,
+      });
+    }
+    if (r.dist && r.dist.dir) {
+      appendPattern({
+        ts: now,
+        symbol: r.symbol,
+        pattern: 'distribution',
+        dir: r.dist.dir,
+        price: r.price,
+        ex: bestP[0],
+        native: bestP[1].native,
+        score: r.score,
+        setupScore: r.dist.score,
+        distKind: r.dist.kind,
+        movePct: r.dist.movePct,
+      });
+    }
+    if (r.chop?.isErsh) {
+      appendPattern({
+        ts: now,
+        symbol: r.symbol,
+        pattern: 'chop',
+        dir: 'arb', // предупреждение, а не сделка: исход — удержался ли диапазон
+        price: r.price,
+        ex: bestP[0],
+        native: bestP[1].native,
+        score: r.score,
+        setupScore: r.chop.score,
+        erThr: CHOP_ER_MAX,
+      });
+    }
+  }
 
   // 5c. Снапшот для бэктеста фильтров (только свежий скан)
   appendSnapshot(
@@ -851,18 +1124,37 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto'): Promis
   };
 }
 
-export async function getScan(top = TOP_DEFAULT, refExchange: ExchangeId | 'auto' = 'auto'): Promise<ScanResponse> {
-  const hit = cache.scan;
-  // Ключ кэша — только top. refExchange влияет лишь на refSpreadPct, а вызовы идут с разными
-  // значениями (главная — с выбранной биржей, radar/liquidity/ai-comment — с 'auto'), поэтому
-  // ключ с refExchange заставлял бы их вытеснять друг друга и гонять полный doScan на каждый
-  // запрос, попутно дублируя снапшоты и записи журнала.
-  if (hit && Date.now() - hit.ts < SCAN_TTL && hit.top === top) {
+/* Кэш сканов: ключ = top + полоса оборота. refExchange в ключ НЕ входит — он влияет лишь
+   на refSpreadPct, а вызовы идут с разными значениями (главная — с выбранной биржей,
+   radar/liquidity/ai-comment — с 'auto'), и ключ с ним заставлял бы их вытеснять друг друга,
+   гоняя полный doScan на каждый запрос и дублируя снапшоты с записями журнала.
+   Полоса в ключе обязательна: это разные наборы монет, и один не является кэшем другого. */
+const SCAN_CACHE_MAX = 4;
+
+function scanKey(top: number, uni: Universe): string {
+  // sampling входит в ключ: при одной и той же полосе это разные наборы монет
+  return `${top}|${uni.minTurnoverUsd}|${uni.maxTurnoverUsd}|${uni.sampling ?? 'top'}`;
+}
+
+export async function getScan(
+  top = TOP_DEFAULT,
+  refExchange: ExchangeId | 'auto' = 'auto',
+  uni: Universe = UNIVERSE_ALL
+): Promise<ScanResponse> {
+  if (!(cache.scans instanceof Map)) cache.scans = new Map();
+  const key = scanKey(top, uni);
+  const hit = cache.scans.get(key);
+  if (hit && Date.now() - hit.ts < SCAN_TTL) {
     // ярлык не переклеиваем: в ответе остаётся та биржа, против которой строки реально посчитаны
     return { ...hit.resp, cached: true };
   }
-  const resp = await doScan(top, refExchange);
-  cache.scan = { ts: Date.now(), top, resp };
+  const resp = await doScan(top, refExchange, uni);
+  cache.scans.set(key, { ts: Date.now(), resp });
+  // вытесняем самый старый: полос немного, но список не должен расти без границы
+  if (cache.scans.size > SCAN_CACHE_MAX) {
+    const oldest = [...cache.scans.entries()].sort((a, b) => a[1].ts - b[1].ts)[0];
+    if (oldest) cache.scans.delete(oldest[0]);
+  }
   return resp;
 }
 

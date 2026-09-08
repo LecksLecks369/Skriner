@@ -16,6 +16,7 @@ import fs from 'fs';
 import path from 'path';
 import type { CoinRow, ExchangeId, PaperTrade } from './types';
 import { netSpreadForPair } from './pair';
+import { arbConvergeLevelPct, arbCostPct, arbFeesPct, arbPnlPct, arbSlLevelPct, arbTpTargetPct } from './costs';
 
 const DATA_DIR = path.join(process.cwd(), 'data');
 const FILE = path.join(DATA_DIR, 'paper_trades.json');
@@ -44,13 +45,20 @@ const TIMEOUT_MS = 6 * 3600_000;
 /** Размер позиции, на который считается слипейдж (совпадает с бюджетом deep-блока) */
 const DEFAULT_SIZE_USD = 25_000;
 
-/** TP: спред сжался до трети от входа (но не строже 0.05%) */
-function tpLevel(netEntry: number): number {
-  return Math.max(0.05, netEntry * 0.35);
+/** Версия модели P&L. v2: издержки круга считаются целиком (комиссии обеих ног ДВАЖДЫ
+    + проскальзывание входа и выхода), а «тейк» ставится по прибыли, а не по схлопыванию
+    спреда. Сделки v1 при загрузке пересчитываются: у них комиссии не вычитались ни разу,
+    и всякое схлопывание помечалось как 'tp' независимо от знака результата. */
+export const PNL_MODEL_VERSION = 2;
+
+/** Полные издержки круга сделки, % от номинала */
+export function tradeCostPct(t: Pick<PaperTrade, 'buyEx' | 'sellEx' | 'slipRoundTripPct'>): number {
+  return arbCostPct(t.buyEx, t.sellEx, t.slipRoundTripPct ?? null);
 }
-/** SL: разрыв разошёлся ещё на 0.25 п.п. против позиции */
-function slLevel(netEntry: number): number {
-  return netEntry + 0.25;
+
+/** P&L, если закрыться прямо сейчас по нетто-спреду cur */
+export function pnlIfClosed(t: Pick<PaperTrade, 'buyEx' | 'sellEx' | 'slipRoundTripPct' | 'netEntry'>, cur: number): number {
+  return arbPnlPct(t.netEntry, cur, tradeCostPct(t));
 }
 
 /* ---------------- Хранилище ---------------- */
@@ -72,7 +80,42 @@ export function loadPaper(): PaperTrade[] {
   } catch {
     store.trades = [];
   }
+  if (migrateClosed(store.trades)) savePaper();
   return store.trades;
+}
+
+/* Пересчёт закрытых сделок старой модели. Все входные величины сохранены в самой сделке
+   (netEntry, netExit, пара бирж, слипейдж), поэтому результат восстанавливается точно —
+   переоценивать по рынку ничего не нужно. Заодно чинится причина закрытия: 'tp' на сделке,
+   которая после издержек в минусе, — это схлопывание разрыва, а не тейк. */
+function migrateClosed(trades: PaperTrade[]): boolean {
+  let changed = 0;
+  for (const t of trades) {
+    if (t.status !== 'closed' || t.netExit == null) continue;
+    if (t.pnlModelV === PNL_MODEL_VERSION) continue;
+    applyPnl(t, t.netExit);
+    if (t.closeReason === 'tp') {
+      const tp = arbTpTargetPct(t.netEntry, t.costPct ?? 0);
+      if (tp == null || (t.pnlPct ?? 0) < tp) t.closeReason = 'converged';
+    }
+    changed++;
+  }
+  if (changed) {
+    console.warn(`[paper] сделок пересчитано по модели издержек v${PNL_MODEL_VERSION}: ${changed}`);
+  }
+  return changed > 0;
+}
+
+/** Записать в сделку издержки и P&L выхода по нетто-спреду netExit */
+function applyPnl(tr: PaperTrade, netExit: number) {
+  const cost = tradeCostPct(tr);
+  const gross = tr.netEntry - netExit;
+  tr.netExit = netExit;
+  tr.feesPct = Number(arbFeesPct(tr.buyEx, tr.sellEx).toFixed(4));
+  tr.costPct = Number(cost.toFixed(4));
+  tr.pnlGrossPct = Number(gross.toFixed(4));
+  tr.pnlPct = Number((gross - cost).toFixed(4));
+  tr.pnlModelV = PNL_MODEL_VERSION;
 }
 
 export function savePaper() {
@@ -130,22 +173,23 @@ export function openPaperTrade(input: OpenInput): PaperTrade {
   return trade;
 }
 
-/** Закрыть сделку по нетто-спреду выхода. P&L = (вход − выход) минус слипейдж входа и выхода. */
+/**
+ * Закрыть сделку по нетто-спреду выхода.
+ * P&L = (нетто-спред входа − нетто-спред выхода) − издержки круга, где издержки =
+ * комиссии пары бирж ДВАЖДЫ (вход и выход) + проскальзывание обеих ног дважды.
+ *
+ * Комиссии обязаны вычитаться отдельной строкой: netEntry и netExit уже посчитаны
+ * за вычетом комиссий одного пересечения, поэтому в их разности комиссии сокращаются
+ * и круг выходил бесплатным. Без стакана (slipModeled=false) учтены только комиссии,
+ * и результат завышен ровно на неучтённое проскальзывание.
+ */
 export function closePaperTrade(id: string, netExit: number, reason: PaperTrade['closeReason']): PaperTrade | null {
   const trades = loadPaper();
   const tr = trades.find((x) => x.id === id && x.status === 'open');
   if (!tr) return null;
   tr.status = 'closed';
   tr.closedTs = Date.now();
-  tr.netExit = netExit;
-  const gross = tr.netEntry - netExit;
-  tr.pnlGrossPct = Number(gross.toFixed(4));
-  /* Симулятор обязан «проедать стакан»: круг пересекает обе книги дважды — на входе
-     (покупка+продажа) и на выходе (обратные ноги). slipRoundTripPct — стоимость одного
-     такого пересечения, поэтому вычитаем её дважды. Без стакана на входе (slipModeled=false)
-     P&L остаётся валовым и завышенным ровно на величину неучтённого проскальзывания. */
-  const slipCost = tr.slipRoundTripPct != null ? tr.slipRoundTripPct * 2 : 0;
-  tr.pnlPct = Number((gross - slipCost).toFixed(4));
+  applyPnl(tr, netExit);
   tr.closeReason = reason || 'manual';
   savePaper();
   return tr;
@@ -155,7 +199,7 @@ export function closePaperTrade(id: string, netExit: number, reason: PaperTrade[
 
 export interface AutoPaperResult {
   opened: number;
-  closed: { tp: number; sl: number; timeout: number };
+  closed: { tp: number; sl: number; timeout: number; converged: number };
 }
 
 /** Сопровождение и набор бумажных сделок по свежему скану. Вызывается из scan. */
@@ -163,9 +207,13 @@ export function autoPaper(rows: CoinRow[]): AutoPaperResult {
   const trades = loadPaper();
   const byS = new Map(rows.map((r) => [r.symbol, r]));
   const now = Date.now();
-  const res: AutoPaperResult = { opened: 0, closed: { tp: 0, sl: 0, timeout: 0 } };
+  const res: AutoPaperResult = { opened: 0, closed: { tp: 0, sl: 0, timeout: 0, converged: 0 } };
 
-  // 1) Сопровождение открытых
+  /* 1) Сопровождение открытых.
+     Тейк ставится по ПРИБЫЛИ после издержек, а не по схлопыванию спреда: раньше выход
+     срабатывал на сжатии разрыва до трети, что при круге дороже самого разрыва давало
+     закрытие с меткой 'tp' и отрицательным P&L. Схлопывание без прибыли теперь честно
+     помечается 'converged' — эджа больше нет, держать позицию незачем, но это не тейк. */
   for (const t of trades.filter((x) => x.status === 'open')) {
     const row = byS.get(t.symbol);
     const cur = row ? netSpreadForPair(row, t.buyEx, t.sellEx) : null;
@@ -174,10 +222,14 @@ export function autoPaper(rows: CoinRow[]): AutoPaperResult {
       if (now - t.ts >= TIMEOUT_MS && closePaperTrade(t.id, t.netEntry, 'timeout')) res.closed.timeout++;
       continue;
     }
-    if (cur <= tpLevel(t.netEntry)) {
+    const tp = arbTpTargetPct(t.netEntry, tradeCostPct(t));
+    const pnlNow = pnlIfClosed(t, cur);
+    if (tp != null && pnlNow >= tp) {
       if (closePaperTrade(t.id, cur, 'tp')) res.closed.tp++;
-    } else if (cur >= slLevel(t.netEntry)) {
+    } else if (cur >= arbSlLevelPct(t.netEntry)) {
       if (closePaperTrade(t.id, cur, 'sl')) res.closed.sl++;
+    } else if (cur <= arbConvergeLevelPct(t.netEntry)) {
+      if (closePaperTrade(t.id, cur, 'converged')) res.closed.converged++;
     } else if (now - t.ts >= TIMEOUT_MS) {
       if (closePaperTrade(t.id, cur, 'timeout')) res.closed.timeout++;
     }
