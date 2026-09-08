@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getScan, UNIVERSE_ALL, UNIVERSE_ILLIQUID, type Universe } from '@/lib/screener/scan';
 import type { ExchangeId } from '@/lib/screener/types';
 import { numParam } from '@/lib/screener/params';
+import { parseAssetClass } from '@/lib/screener/assetClass';
 
 /** Полоса оборота: пресет `universe=illiquid|all` либо явные границы в USD */
 function universeFrom(sp: URLSearchParams): Universe {
@@ -25,7 +26,8 @@ export async function GET(req: NextRequest) {
     const top = Math.trunc(numParam(sp, 'top', 80, 10, 200));
     const refRaw = (sp.get('ref') || 'auto') as ExchangeId | 'auto';
     const ref = ['bybit', 'bingx', 'okx', 'bitget', 'mexc', 'ourbit'].includes(refRaw) ? (refRaw as ExchangeId) : 'auto';
-    const resp = await getScan(top, ref, universeFrom(sp));
+    // assetClass: crypto по умолчанию — TradFi-перпы (акции, нефть, золото) в скан не идут
+    const resp = await getScan(top, ref, universeFrom(sp), parseAssetClass(sp.get('assetClass')));
     return NextResponse.json(resp);
   } catch (e) {
     console.error('[scan] failed:', e);

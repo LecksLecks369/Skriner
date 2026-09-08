@@ -3,7 +3,10 @@
    регулярные интервалы, всплеск тейкер-агрессии + тонкий стакан + разошедшийся спред. */
 
 import type { Book, TapeTrade } from './exchanges';
-import type { Candle, ExchangeId, ExDepth, LiquidityDeep, TapeStats } from './types';
+import { EXCHANGES, type Candle, type ExchangeId, type ExDepth, type LiquidityDeep, type TapeStats } from './types';
+import { computeMm } from './mm';
+
+const MAKER_FEE = Object.fromEntries(EXCHANGES.map((e) => [e.id, e.makerFee])) as Record<ExchangeId, number>;
 
 const MAX_SLIP_PCT = 0.3; // порог «безопасного» проскальзывания для max-позиции
 
@@ -182,6 +185,7 @@ export function analyzeTape(trades: TapeTrade[], now = Date.now()): TapeStats | 
     windowSec,
     trades: trades.length,
     tradesPerMin: Math.round(tradesPerMin * 10) / 10,
+    usdPerMin: Math.round((total / windowSec) * 60),
     aggression: Math.round(aggression * 1000) / 1000,
     clipRatio: Math.round(clipRatio * 1000) / 1000,
     clipCount,
@@ -344,6 +348,10 @@ export interface DeepInput {
   netSpreadPct: number | null;
   crossSpreadPct: number | null;
   turnoverUsd: number;
+  /* Волатильность для оценки маркет-мейкинга: NATR% на свече своего интервала.
+     Приводится к минуте корнем из интервала — у Bitget свечи 3м, у остальных 1м. */
+  natrPct?: number | null;
+  natrIntervalMin?: number;
 }
 
 export function assembleDeep(inp: DeepInput): LiquidityDeep {
@@ -387,6 +395,25 @@ export function assembleDeep(inp: DeepInput): LiquidityDeep {
   const algo = algoScoreOf({ tape: inp.tape, volZ: inp.volZ, dOiPct15m: inp.dOiPct15m, sweepAgeMin: inp.sweepAgeMin });
   const illiq = illiqScoreOf(depth25, slip25k, inp.amihud, inp.turnoverUsd);
   const pattern = buildPattern(algo, illiq, inp.netSpreadPct, inp.crossSpreadPct, inp.tape, depth25, slip25k, inp.dOiPct15m);
+
+  /* Маркет-мейкинг считается на бирже, где есть И стакан, И лента: спред своей книги
+     и поток, который через неё идёт, — величины одной площадки, смешивать их нельзя. */
+  const mmEx = inp.tapeEx && inp.depths[inp.tapeEx] ? inp.tapeEx : null;
+  const mmDepth = mmEx ? inp.depths[mmEx] : null;
+  const sigma1mPct =
+    inp.natrPct != null && inp.natrPct > 0 ? inp.natrPct / Math.sqrt(Math.max(1, inp.natrIntervalMin ?? 1)) : null;
+  const mm =
+    mmEx && mmDepth && inp.tape
+      ? computeMm({
+          ex: mmEx,
+          bookSpreadPct: mmDepth.bookSpreadPct,
+          makerFee: MAKER_FEE[mmEx] ?? 0.0002,
+          depth10Usd: mmDepth.depth10Usd,
+          flowUsdPerMin: inp.tape.usdPerMin,
+          sigma1mPct,
+          maxPosUsd: mmDepth.maxPosUsd,
+        })
+      : null;
   return {
     ts: Date.now(),
     perEx: inp.depths,
@@ -403,6 +430,7 @@ export function assembleDeep(inp: DeepInput): LiquidityDeep {
     algoScore: algo,
     illiqScore: illiq,
     pattern,
+    mm,
   };
 }
 

@@ -7,6 +7,7 @@ import { EX_MAP } from '@/components/screener/format';
 /* Пороги паттерна берутся из детектора, а не переписываются числом в подписи:
    разошедшаяся подпись объясняет правило, которого нет. */
 import { ROBOT_ALGO_MIN, ROBOT_ILLIQ_MIN, TAPE_MIN_TRADES } from '@/lib/screener/liquidity';
+import { MM_DEFAULT_QUOTE_USD } from '@/lib/screener/mm';
 
 /* Раздел «Неликвид»: детектор входа робота в неликвидные монеты.
    Паттерн = механические клипы + регулярные интервалы + тейкер-агрессия
@@ -103,6 +104,8 @@ function getVal(r: CoinRow, key: string): number | string | null {
       return d?.slip25kPct ?? null;
     case 'maxpos':
       return d?.maxPosUsd ?? null;
+    case 'mm':
+      return d?.mm?.score ?? null;
     case 'depth':
       if (!d) return null;
       return Math.min(...Object.values(d.perEx).map((x) => x.depth25Usd));
@@ -380,6 +383,7 @@ export default function LiquidityPage() {
                       {th('slip', 'Слип $10k')}
                       {th('slip', 'Слип $25k')}
                       {th('slip', 'Слип $50k')}
+                      {th('mm', 'ММ')}
                       {th('maxpos', 'Max позиция')}
                       {th('depth', 'Глубина ±0.25%')}
                       {th('aggr', 'Агрессия')}
@@ -425,6 +429,29 @@ export default function LiquidityPage() {
                               </td>
                             );
                           })}
+                          {/* Маркет-мейкинг: спред своей книги минус две мейкерские комиссии. Ключевая
+                              величина — не доход, а volRatio: забираемый за круг спред против движения
+                              цены за это же время. Ниже 1 котировку сносит шумом раньше, чем она
+                              заработает, поэтому такие строки не подсвечиваются как возможность. */}
+                          <td
+                            className="px-2 py-1.5 font-mono tabular-nums"
+                            title={
+                              d?.mm
+                                ? `${d.mm.ex}: спред ${d.mm.spreadBps} б.п. → ${d.mm.spreadNetBps} б.п. после двух мейкерских комиссий\n` +
+                                  `котировка $${d.mm.quoteSizeUsd} на сторону · ${d.mm.roundTripsPerHour} кругов/ч · держим ${d.mm.holdMin ?? '—'} мин\n` +
+                                  `спред за круг / ход цены за это время = ${d.mm.volRatio ?? '—'} (нужно >1)\n` +
+                                  `валовая оценка $${d.mm.grossUsdPerHour}/ч — без адверс-селекшена и приоритета в очереди`
+                                : 'нет стакана и ленты на одной бирже'
+                            }
+                          >
+                            {d?.mm ? (
+                              <span className={d.mm.viable ? 'text-emerald-400' : d.mm.spreadNetBps <= 0 ? 'text-zinc-600' : 'text-zinc-400'}>
+                                {d.mm.viable ? `$${d.mm.grossUsdPerHour}/ч` : d.mm.spreadNetBps <= 0 ? 'нет спреда' : `×${d.mm.volRatio ?? '—'}`}
+                              </span>
+                            ) : (
+                              <span className="text-zinc-700">—</span>
+                            )}
+                          </td>
                           <td className="px-2 py-1.5 font-mono tabular-nums text-zinc-200">${fmtUsd(d?.maxPosUsd ?? null)}</td>
                           <td className={`px-2 py-1.5 font-mono tabular-nums ${minDepth != null && minDepth < 100_000 ? 'text-amber-400' : 'text-zinc-300'}`}>
                             ${fmtUsd(minDepth)}
@@ -511,6 +538,14 @@ export default function LiquidityPage() {
           всплеском ΔOI/объёма. «Неликвид» — насколько тонкий рынок: глубина стакана в ±0.25%, проскальзывание рыночных
           ордеров $10k/$25k/$50k, коэффициент Амихуда (% движения на $1M) и оборот. «Max позиция» — крупнейший ордер с
           слипейджем ≤0.3% на худшей из бирж входа/выхода — больше этой суммы входить опасно, сами разгоните спред.
+          Колонка «ММ» — пассивный маркет-мейкинг: спред собственной книги минус две мейкерские комиссии, на бирже, где
+          есть и стакан, и лента. Зелёное число — валовая оценка $/час при котировке ${MM_DEFAULT_QUOTE_USD} на сторону
+          (ограничена max-позицией). «×N» — не возможность, а причина отказа: за круг забирается в N раз меньше, чем
+          цена успевает пройти за это же время, и котировку сносит шумом раньше, чем она заработает; нужно больше 1.
+          «Нет спреда» — спред книги уже́ двух мейкерских комиссий, пассивно заработать нельзя в принципе. Оценка
+          валовая: без адверс-селекшена и без приоритета в очереди, то есть это потолок, а не ожидание.
+          <br />
+          <br />
           Паттерн «робот вошёл» = алго ≥{ROBOT_ALGO_MIN} + неликвид ≥{ROBOT_ILLIQ_MIN} при ленте не реже{' '}
           {TAPE_MIN_TRADES} сделок в часовом окне: кто-то работает в тонкой книге механически. Межбиржевого разрыва в
           условии больше нет — на замере полосы неликвида спред и алго-активность не совпадали ни разу, это разные

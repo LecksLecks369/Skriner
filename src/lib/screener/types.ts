@@ -1,19 +1,26 @@
+import type { AssetClass, AssetClassFilter } from './assetClass';
+
 export type ExchangeId = 'bybit' | 'bingx' | 'okx' | 'bitget' | 'mexc' | 'ourbit';
 
 export interface ExchangeInfo {
   id: ExchangeId;
   name: string;
   takerFee: number; // доля, напр. 0.00055 = 0.055%
+  makerFee: number; // доля; нужна для оценки пассивного маркет-мейкинга
   color: string;
 }
 
+/* Комиссии — базовый уровень (VIP0) для бессрочных контрактов. У аккаунта с объёмом
+   или реферальной скидкой они ниже, и тогда все расчёты издержек здесь консервативны.
+   Мейкерская ставка используется только в оценке маркет-мейкинга; тейкерская — везде,
+   где считается стоимость круга. */
 export const EXCHANGES: ExchangeInfo[] = [
-  { id: 'bybit', name: 'Bybit', takerFee: 0.00055, color: '#f7a600' },
-  { id: 'bingx', name: 'BingX', takerFee: 0.0005, color: '#2f6bff' },
-  { id: 'okx', name: 'OKX', takerFee: 0.0005, color: '#8cc63f' },
-  { id: 'bitget', name: 'Bitget', takerFee: 0.0006, color: '#00f0ff' },
-  { id: 'mexc', name: 'MEXC', takerFee: 0.0002, color: '#00b897' },
-  { id: 'ourbit', name: 'Ourbit', takerFee: 0.00055, color: '#9d7bff' },
+  { id: 'bybit', name: 'Bybit', takerFee: 0.00055, makerFee: 0.0002, color: '#f7a600' },
+  { id: 'bingx', name: 'BingX', takerFee: 0.0005, makerFee: 0.0002, color: '#2f6bff' },
+  { id: 'okx', name: 'OKX', takerFee: 0.0005, makerFee: 0.0002, color: '#8cc63f' },
+  { id: 'bitget', name: 'Bitget', takerFee: 0.0006, makerFee: 0.0002, color: '#00f0ff' },
+  { id: 'mexc', name: 'MEXC', takerFee: 0.0002, makerFee: 0, color: '#00b897' },
+  { id: 'ourbit', name: 'Ourbit', takerFee: 0.00055, makerFee: 0.0002, color: '#9d7bff' },
 ];
 
 export interface RawTicker {
@@ -115,6 +122,7 @@ export interface ExchangeRow {
 
 export interface CoinRow {
   symbol: string; // BTCUSDT
+  assetClass: AssetClass; // crypto | tradfi — перпы на акции/нефть/золото живут по расписанию закрытого рынка
   bestBid?: { exchange: ExchangeId; price: number };
   bestAsk?: { exchange: ExchangeId; price: number };
   price: number; // медианная цена
@@ -193,12 +201,28 @@ export interface TapeStats {
   windowSec: number; // сколько секунд покрывает лента
   trades: number;
   tradesPerMin: number;
+  usdPerMin: number; // оборот ленты, USD в минуту — поток, на котором зарабатывает маркет-мейкер
   aggression: number; // (тейкер-покупки - тейкер-продажи)/всего, -1..1
   clipRatio: number; // доля объёма в кластере одноразмерных клипов, 0..1
   clipCount: number; // сделок в кластере
   clipUsd: number; // средний размер клипа, USD
   gapCv: number | null; // CV интервалов между клипами (<0.4 = механическая регулярность)
   bigNetUsd: number; // нетто сделок >$100k (buy-sell), USD
+}
+
+/* ---------- Маркет-мейкинг: жизнеспособность пассивной котировки ----------
+   Модель и её допущения — в lib/screener/mm.ts; здесь только форма результата. */
+export interface MmViability {
+  ex: ExchangeId;
+  spreadBps: number; // спред стакана, б.п.
+  spreadNetBps: number; // минус две мейкерские комиссии — доход за круг
+  quoteSizeUsd: number; // размер котировки на сторону
+  roundTripsPerHour: number;
+  holdMin: number | null; // минут на круг
+  volRatio: number | null; // спред за круг / движение цены за это время; >1 = условие выполнено
+  grossUsdPerHour: number | null; // валовая оценка: без адверс-селекшена и приоритета очереди
+  score: number; // 0-100
+  viable: boolean;
 }
 
 /* ---------- Неликвид: полный deep-блок монеты ---------- */
@@ -218,6 +242,7 @@ export interface LiquidityDeep {
   algoScore: number; // 0-100: клипы + регулярность + агрессия + всплеск
   illiqScore: number; // 0-100: глубина + слипейдж + Амихуд + оборот (больше = неликвиднее)
   pattern: { robotIlliquid: boolean; reasons: string[] } | null;
+  mm: MmViability | null; // пассивный маркет-мейкинг: считается по бирже, где есть и стакан, и лента
 }
 
 export interface ExchangeStatus {
@@ -278,6 +303,8 @@ export interface ScanResponse {
   top: number;
   klinedSymbols: number;
   rows: CoinRow[];
+  assetClass: AssetClassFilter; // по какому классу собран этот скан
+  excludedByClass: number; // сколько инструментов отсеяно классом до отбора топ-N
   statuses: ExchangeStatus[];
   errors: Record<string, string>;
   refExchange: ExchangeId | 'auto';

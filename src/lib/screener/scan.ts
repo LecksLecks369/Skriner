@@ -10,6 +10,7 @@ import {
   type ScanResponse,
 } from './types';
 import { fetchKlines, fetchTickers, pMap, fetchBingxPremium, fetchBingxOI, fetchBingxTaker, fetchOkxFunding, fetchOkxOI, fetchBitgetOI, fetchSpotPrices, fetchWhaleTrades, fetchOrderbook, fetchTape, fetchOkxLiquidations, fetchLsr, fetchFundingIntervals, normalizeFunding, type Book, type SpotMap, type TapeTrade, type WhaleInfo, type LiqInfo, type LsrInfo, type FundingIntervals } from './exchanges';
+import { assetClassMap, classifySymbol, type AssetClass, type AssetClassFilter } from './assetClass';
 import { computeScore, detectSweep, execSpreadPct, natrPct, volumeZ, cvdProxy, btcCorr } from './score';
 import { detectBreakout, detectChop, detectDistribution, CHOP_ER_MAX } from './setups';
 import { amihudPct, algoProxyOf, analyzeBook, analyzeTape, assembleDeep, illiqProxyOf } from './liquidity';
@@ -321,7 +322,12 @@ function selectUniverse<T extends { maxTurnover: number }>(candidates: T[], top:
 const DEEP_TARGETS = 40;
 const DEEP_ILLIQ_QUOTA = 10;
 
-async function doScan(top: number, refExchangePref: ExchangeId | 'auto', uni: Universe = UNIVERSE_ALL): Promise<ScanResponse> {
+async function doScan(
+  top: number,
+  refExchangePref: ExchangeId | 'auto',
+  uni: Universe = UNIVERSE_ALL,
+  assetClass: AssetClassFilter = 'crypto'
+): Promise<ScanResponse> {
   warmupSeries(); // прогрев: восстановить серии с диска до первых записей
   const now = Date.now();
   const [tickers, fundingIntervals] = await Promise.all([getTickers(), getFundingIntervals()]);
@@ -357,6 +363,25 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto', uni: Un
 
   // 1b. Отсев бирж, торгующих под этим тикером другой инструмент
   dropMismatchedVenues(agg);
+
+  /* 1c. Класс актива. Отсев обязан идти ДО полосы оборота и отбора топ-N:
+     TradFi-перпы оборотисты (нефть и золото дают больше $1B в сутки), и если
+     резать их после отбора, они сначала займут места в выдаче, а крипта
+     недоберёт монет до top. */
+  const clsMap = await assetClassMap().catch((e) => {
+    console.error('[scan] справочник классов недоступен, класс не фильтруется:', e);
+    return new Map<string, AssetClass>();
+  });
+  const classOf = (s: string): AssetClass => classifySymbol(s, clsMap);
+  let excludedByClass = 0;
+  if (assetClass !== 'all' && clsMap.size > 0) {
+    for (const sym of [...agg.keys()]) {
+      if (classOf(sym) !== assetClass) {
+        agg.delete(sym);
+        excludedByClass += 1;
+      }
+    }
+  }
 
   // 2. Полоса оборота, затем отбор внутри неё (см. selectUniverse)
   const inBand = [...agg.values()]
@@ -680,6 +705,7 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto', uni: Un
 
     rows.push({
       symbol: a.symbol,
+      assetClass: classOf(a.symbol),
       bestBid,
       bestAsk,
       price,
@@ -874,6 +900,10 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto', uni: Un
         netSpreadPct: r.netSpreadPct,
         crossSpreadPct: r.crossSpreadPct,
         turnoverUsd: r.turnoverUsd,
+        /* Волатильность берётся с той же биржи, где считается маркет-мейкинг (там же лента),
+           а не максимум по монете: чужая свеча описывает чужую книгу. */
+        natrPct: r.exchanges.find((e) => e.exchange === tapeEx)?.natrPct ?? r.natrPctMax,
+        natrIntervalMin: tapeEx === 'bitget' ? 3 : 1,
       });
 
       /* Пересчёт скора по стакану: до этого момента мультибиржевой блок считал спред
@@ -1035,6 +1065,8 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto', uni: Un
         setupScore: r.breakout.score,
         level: r.breakout.level,
         distAtr: r.breakout.distAtr,
+        chopScore: r.chop?.score ?? null,
+        natrPct: r.natrPctMax,
       });
     }
     if (r.dist && r.dist.dir) {
@@ -1115,6 +1147,9 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto', uni: Un
     top: ranked.length,
     klinedSymbols: klinesBy.size,
     rows,
+    assetClass,
+    // скачок этого числа = биржа изменила состав инструментов
+    excludedByClass,
     statuses,
     errors,
     refExchange: refExchangePref === 'auto' ? 'auto' : refExchangePref,
@@ -1131,24 +1166,25 @@ async function doScan(top: number, refExchangePref: ExchangeId | 'auto', uni: Un
    Полоса в ключе обязательна: это разные наборы монет, и один не является кэшем другого. */
 const SCAN_CACHE_MAX = 4;
 
-function scanKey(top: number, uni: Universe): string {
-  // sampling входит в ключ: при одной и той же полосе это разные наборы монет
-  return `${top}|${uni.minTurnoverUsd}|${uni.maxTurnoverUsd}|${uni.sampling ?? 'top'}`;
+function scanKey(top: number, uni: Universe, assetClass: AssetClassFilter): string {
+  // sampling и класс входят в ключ: при одной и той же полосе это разные наборы монет
+  return `${top}|${uni.minTurnoverUsd}|${uni.maxTurnoverUsd}|${uni.sampling ?? 'top'}|${assetClass}`;
 }
 
 export async function getScan(
   top = TOP_DEFAULT,
   refExchange: ExchangeId | 'auto' = 'auto',
-  uni: Universe = UNIVERSE_ALL
+  uni: Universe = UNIVERSE_ALL,
+  assetClass: AssetClassFilter = 'crypto'
 ): Promise<ScanResponse> {
   if (!(cache.scans instanceof Map)) cache.scans = new Map();
-  const key = scanKey(top, uni);
+  const key = scanKey(top, uni, assetClass);
   const hit = cache.scans.get(key);
   if (hit && Date.now() - hit.ts < SCAN_TTL) {
     // ярлык не переклеиваем: в ответе остаётся та биржа, против которой строки реально посчитаны
     return { ...hit.resp, cached: true };
   }
-  const resp = await doScan(top, refExchange, uni);
+  const resp = await doScan(top, refExchange, uni, assetClass);
   cache.scans.set(key, { ts: Date.now(), resp });
   // вытесняем самый старый: полос немного, но список не должен расти без границы
   if (cache.scans.size > SCAN_CACHE_MAX) {

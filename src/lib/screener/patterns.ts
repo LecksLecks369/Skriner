@@ -68,6 +68,8 @@ export interface PatternSignal {
   distAtr?: number; // расстояние до уровня в ATR на момент сигнала
   distKind?: string; // pump_distribution | dump_absorption
   movePct?: number; // ход, вызвавший сигнал раздачи
+  chopScore?: number | null; // ершистость на момент сигнала: проверка, режет ли фильтр ложные пробои
+  natrPct?: number | null; // волатильность монеты: без неё нельзя отличить эдж от размаха
   erThr?: number; // для «ерша»: порог эффективности, ниже которого пила считается сохранившейся
   bandPct?: number; // legacy: полуширина диапазона у сигналов до перехода на будущий ER
 }
