@@ -120,7 +120,7 @@ export async function GET(req: NextRequest) {
             const setupAlerts: Array<Record<string, unknown>> = [];
             for (const row of resp.rows as CoinRow[]) {
               const b = row.breakout;
-              if (b && !muted.breakout && !b.fired && b.score >= BREAKOUT_ALERT) {
+              if (b && !muted.breakout && b.ready && b.score >= BREAKOUT_ALERT) {
                 if (now - (breakoutSent.get(row.symbol) || 0) >= 15 * 60_000) {
                   breakoutSent.set(row.symbol, now);
                   setupAlerts.push({

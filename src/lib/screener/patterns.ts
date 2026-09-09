@@ -22,6 +22,7 @@ import path from 'path';
 import type { Candle, ExchangeId } from './types';
 import { fetchKlines } from './exchanges';
 import { seriesStore } from './store';
+import { CHOP_ER_MAX } from './setups';
 import {
   arbConvergeLevelPct,
   arbFeesPct,
@@ -100,6 +101,7 @@ export interface PatternOutcome {
   costPct?: number; // издержки круга, вычтенные из результата, %
   costSlipModeled?: boolean; // false = проскальзывание не учтено (только комиссии), результат завышен
   erAfter?: number | null; // «ёрш»: эффективность хода на будущем окне — та же величина, что и в детекторе
+  erThrUsed?: number; // порог, по которому вынесен вердикт: исходы с другим порогом несравнимы
 }
 
 /* ---------------- Хранилище ---------------- */
@@ -156,7 +158,7 @@ export const PATTERN_META: Record<PatternKind, { icon: string; name: string; hin
   funding: { icon: '💸', name: 'Фандинг', hint: 'ход против толпы +0.4% раньше стопа −0.4%, минус круг тейкером (30 минут)' },
   breakout: { icon: '⚡', name: 'Пробой', hint: 'ход в сторону уровня +0.5% раньше стопа −0.5% (30 минут)' },
   distribution: { icon: '📦', name: 'Раздача', hint: 'разворот против пампа/дампа +0.5% раньше стопа −0.5% (30 минут)' },
-  chop: { icon: '〰', name: 'Ёрш', hint: 'пила сохранилась: эффективность хода за следующие 30 минут ≤ 0.32 — тренда не случилось' },
+  chop: { icon: '〰', name: 'Ёрш', hint: 'пила сохранилась: эффективность хода за следующие 30 минут ≤ 0.025 (p10 популяции) — базовая частота такого исхода 10%' },
 };
 
 /** Все типы паттернов — из PATTERN_META, чтобы список не расходился при добавлении нового */
@@ -214,7 +216,12 @@ function loadOutcomes(): Record<string, PatternOutcome> {
            Критерий заменён на ту же величину, которой ёрш и определяется — эффективность
            хода на будущем окне. Исходы без erAfter посчитаны по снятому правилу и
            смешивать их с новыми нельзя. */
-        const legacyChop = key.startsWith('chop:') && oc.win != null && oc.erAfter == null;
+        /* Исход ерша сравним только с тем же порогом: порог взят из квантилей популяции
+           и при передвижении меняет смысл вердикта, а не его точность. Исходы,
+           посчитанные другим порогом (и тем более полосой цены, до erAfter),
+           выбрасываются — смешивать их в один win-rate нельзя. */
+        const legacyChop =
+          key.startsWith('chop:') && oc.win != null && (oc.erAfter == null || oc.erThrUsed !== CHOP_ER_MAX);
         const stale = legacyChop || (oc.win != null && (oc.v ?? 1) < OUTCOME_VERSION);
         if (stale) {
           dropped++;
@@ -420,6 +427,7 @@ function evalChopPersist(path: PathPt[], entry: number, ts0: number, erMax: numb
     v: OUTCOME_VERSION,
     pnlPct: null,
     erAfter: r3(er),
+    erThrUsed: erMax,
   };
 }
 

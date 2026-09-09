@@ -51,6 +51,14 @@ interface CacheGlobal {
     lsr: Map<string, { ts: number; v: LsrInfo | null }>;
     scan: { ts: number; top: number; resp: ScanResponse } | null; // legacy-слот, живёт в globalThis после HMR
     scans: Map<string, { ts: number; resp: ScanResponse }>; // ключ: top + полоса оборота
+    /* Идущие прямо сейчас сканы по ключу. Без этого каждый параллельный вызов запускал
+       свой полный круг запросов ко всем биржам: один скан — это тикеры шести бирж плюс
+       свечи, OI, фандинг, стаканы и ленты по 80 монетам. Скан дёргают одновременно
+       SSE-стрим алертов (раз в 20с), опрос UI (раз в 30с) и внешние клиенты, поэтому
+       наложения постоянны, и биржи начинают отвечать отказом СРАЗУ ВСЕ — в ответе
+       остаётся ноль строк, сигналы не рождаются, а серии рвутся, из-за чего исходы
+       потом нечем дооценить. Ожидающие переиспользуют один и тот же промис. */
+    inflight: Map<string, Promise<ScanResponse>>;
   };
 }
 const g = globalThis as unknown as CacheGlobal;
@@ -71,6 +79,7 @@ if (!g.__screenerScan) {
     lsr: new Map(),
     scan: null,
     scans: new Map(),
+    inflight: new Map(),
   };
 }
 const cache = g.__screenerScan;
@@ -78,6 +87,7 @@ const cache = g.__screenerScan;
 if (!cache.prem) cache.prem = new Map();
 if (!cache.whale) cache.whale = new Map();
 if (!cache.books) cache.books = new Map();
+if (!(cache.inflight instanceof Map)) cache.inflight = new Map();
 if (!cache.tapes) cache.tapes = new Map();
 if (!cache.liq) cache.liq = new Map();
 if (!cache.lsr) cache.lsr = new Map();
@@ -1052,7 +1062,7 @@ async function doScan(
     if (!a) continue;
     const bestP = [...a.per.entries()].sort((x, y) => y[1].turnover - x[1].turnover)[0];
 
-    if (r.breakout && !r.breakout.fired && r.breakout.score >= BREAKOUT_ALERT) {
+    if (r.breakout && r.breakout.ready && r.breakout.score >= BREAKOUT_ALERT) {
       appendPattern({
         ts: now,
         symbol: r.symbol,
@@ -1184,13 +1194,36 @@ export async function getScan(
     // ярлык не переклеиваем: в ответе остаётся та биржа, против которой строки реально посчитаны
     return { ...hit.resp, cached: true };
   }
-  const resp = await doScan(top, refExchange, uni, assetClass);
-  cache.scans.set(key, { ts: Date.now(), resp });
-  // вытесняем самый старый: полос немного, но список не должен расти без границы
-  if (cache.scans.size > SCAN_CACHE_MAX) {
-    const oldest = [...cache.scans.entries()].sort((a, b) => a[1].ts - b[1].ts)[0];
-    if (oldest) cache.scans.delete(oldest[0]);
-  }
-  return resp;
+  /* Скан по этому ключу уже идёт — ждём его вместо второго круга запросов к биржам */
+  if (!(cache.inflight instanceof Map)) cache.inflight = new Map();
+  const pending = cache.inflight.get(key);
+  if (pending) return pending;
+
+  const p = doScan(top, refExchange, uni, assetClass)
+    .then((resp) => {
+      /* Скан, в котором не ответила НИ ОДНА биржа, кэшировать нельзя: один сетевой
+         сбой иначе гасит скринер на весь TTL — пустой ответ отдаётся всем 45 секунд,
+         сигналы в это время не рождаются, а серии рвутся, и потом нечем дооценить
+         исходы. Такой ответ не кэшируем, а отдаём последний удачный (с его собственным
+         ts и флагом cached, по которым видно, что данные не свежие). */
+      const anyOk = (resp.statuses ?? []).some((s) => s?.ok);
+      if (!anyOk) {
+        const prev = cache.scans.get(key);
+        if (prev) return { ...prev.resp, cached: true };
+        return resp;
+      }
+      cache.scans.set(key, { ts: Date.now(), resp });
+      // вытесняем самый старый: полос немного, но список не должен расти без границы
+      if (cache.scans.size > SCAN_CACHE_MAX) {
+        const oldest = [...cache.scans.entries()].sort((a, b) => a[1].ts - b[1].ts)[0];
+        if (oldest) cache.scans.delete(oldest[0]);
+      }
+      return resp;
+    })
+    .finally(() => {
+      cache.inflight.delete(key);
+    });
+  cache.inflight.set(key, p);
+  return p;
 }
 

@@ -329,7 +329,7 @@ export function CoinModal({
                   <div className="flex flex-wrap items-center gap-2">
                     <span
                       className={`rounded px-1.5 py-0.5 text-[11px] font-semibold ${
-                        row.breakout.fired
+                        !row.breakout.ready
                           ? 'bg-zinc-700/40 text-zinc-400'
                           : row.breakout.score >= 60
                             ? 'bg-emerald-500/15 text-emerald-400'
@@ -339,6 +339,11 @@ export function CoinModal({
                       ⚡ Пробой {row.breakout.dir === 'up' ? 'вверх ↑' : 'вниз ↓'} · готовность {row.breakout.score}
                     </span>
                     {row.breakout.fired && <span className="text-[11px] text-zinc-500">цена уже за уровнем — это подтверждение, а не прогноз</span>}
+                    {!row.breakout.fired && !row.breakout.ready && (
+                      <span className="text-[11px] text-zinc-500">
+                        до уровня {row.breakout.distAtr} ATR — сигналом не считается: дальше 0.5 ATR матожидание измерено отрицательным
+                      </span>
+                    )}
                   </div>
                   <div className="mt-1 text-[11px] text-zinc-500">
                     уровень {fmtPrice(row.breakout.level)} · до него {row.breakout.distAtr} ATR ({row.breakout.distPct.toFixed(2)}%) · диапазон{' '}
