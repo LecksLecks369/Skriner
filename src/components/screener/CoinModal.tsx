@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import type { CoinRow, PaperTrade } from '@/lib/screener/types';
 import type { NetworkInfo } from '@/lib/screener/networks';
 import { netSpreadForPair } from '@/lib/screener/pair';
+import { BREAKOUT_MAX_DIST_ATR } from '@/lib/screener/setups';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -341,7 +342,7 @@ export function CoinModal({
                     {row.breakout.fired && <span className="text-[11px] text-zinc-500">цена уже за уровнем — это подтверждение, а не прогноз</span>}
                     {!row.breakout.fired && !row.breakout.ready && (
                       <span className="text-[11px] text-zinc-500">
-                        до уровня {row.breakout.distAtr} ATR — сигналом не считается: дальше 0.5 ATR матожидание измерено отрицательным
+                        до уровня {row.breakout.distAtr} ATR — сигналом не считается: дальше {BREAKOUT_MAX_DIST_ATR} ATR цене до границы ещё идти
                       </span>
                     )}
                   </div>

@@ -28,6 +28,9 @@ interface PatternStat {
   byExit: { tp: number; sl: number; timeout: number; converged: number };
   avgMaeWin: number | null;
   edge: EdgeReport;
+  population: string;
+  alertScope: 'same' | 'differs' | 'none';
+  alertNote: string;
 }
 
 /* Отчёт по эджу: матожидание с доверительным интервалом и вердикт. Одно число без
@@ -130,7 +133,7 @@ function metricOf(s: PatternSig): string {
         (s.movePct ?? 0) > 0 ? '+' : ''
       }${(s.movePct ?? 0).toFixed(2)}%`;
     case 'chop':
-      return `ёрш ${s.setupScore ?? '—'} · порог эффективности ≤ ${(s.erThr ?? 0.32).toFixed(2)}`;
+      return `ёрш ${s.setupScore ?? '—'} · порог эффективности ≤ ${s.erThr != null ? s.erThr.toFixed(3) : '—'}`;
   }
 }
 
@@ -213,6 +216,25 @@ export function PatternHistory() {
               <div className="text-[10px] text-zinc-600">
                 в плюс из решённых: {st.wins} из {st.wins + st.losses}
               </div>
+              {/* Подпись популяции. Цифра выше описывает выборку, а не рынок, и без
+                  условия отбора неинтерпретируема. Отдельной строкой — расхождение с
+                  алертом: у спреда порог записи фиксирован, а порог алерта пользователь
+                  задаёт сам, поэтому win-rate посчитан не по тем сигналам, которые до
+                  него доехали, и молчать об этом нельзя. */}
+              <div className="mt-1 text-[10px] leading-snug text-zinc-600">
+                <span className="text-zinc-700">считается по: </span>
+                {st.population}
+              </div>
+              {st.alertScope !== 'same' && (
+                <div
+                  className={`mt-0.5 text-[10px] leading-snug ${
+                    st.alertScope === 'differs' ? 'text-amber-500/80' : 'text-zinc-700'
+                  }`}
+                >
+                  {st.alertScope === 'differs' ? '⚠ ' : ''}
+                  {st.alertNote}
+                </div>
+              )}
               {st.edge && st.edge.expectancyPct != null && (
                 <div className="mt-1.5 rounded border border-zinc-800/80 bg-zinc-950/40 p-1.5 text-[10px] tabular-nums">
                   <div className="flex items-baseline justify-between gap-1">

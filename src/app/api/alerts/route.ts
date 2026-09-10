@@ -57,6 +57,10 @@ export async function GET(req: NextRequest) {
               robot: isPatternMuted('robot'),
               breakout: isPatternMuted('breakout'),
               distribution: isPatternMuted('distribution'),
+              /* Ёрш едет пометкой внутри пробоя, но это такое же утверждение о рынке,
+                 как и остальные, — и оно тоже должно сниматься, когда доказано, что
+                 попадания не превышают базовой частоты. */
+              chop: isPatternMuted('chop'),
             };
             const alerts: Array<Record<string, unknown>> = [];
             for (const row of resp.rows as CoinRow[]) {
@@ -113,10 +117,15 @@ export async function GET(req: NextRequest) {
 
             /* Сетапы движения: пробой — только ДО выхода за уровень (иначе это уже
                не предупреждение, а констатация), раздача/набор — только когда поток
-               расходится с ценой. Пороги те же, по которым сигнал пишется в историю
-               паттернов, поэтому win-rate во вкладке «История» относится ровно к этим
-               алертам. Ёрш отдельным алертом не шлём — он приезжает пометкой внутри
-               пробоя: его смысл в том, чтобы НЕ входить. */
+               расходится с ценой. Ёрш отдельным алертом не шлём — он приезжает пометкой
+               внутри пробоя: его смысл в том, чтобы НЕ входить.
+
+               Пороги ЗДЕСЬ те же, по которым сигнал пишется в историю паттернов, поэтому
+               win-rate пробоя и раздачи во вкладке «История» относится ровно к этим
+               алертам. На спред это НЕ распространяется: порог его записи фиксирован
+               (RECORD_THR.spreadNetPct), а init.thresholdPct задаёт пользователь, так что
+               популяции расходятся. Вкладка «История» подписывает это у каждой карточки
+               полем alertScope — утверждать совпадение по всем типам сразу нельзя. */
             const setupAlerts: Array<Record<string, unknown>> = [];
             for (const row of resp.rows as CoinRow[]) {
               const b = row.breakout;
@@ -134,7 +143,7 @@ export async function GET(req: NextRequest) {
                     squeeze: b.squeeze,
                     touches: b.touches,
                     chopScore: row.chop?.score ?? null,
-                    isErsh: row.chop?.isErsh ?? false,
+                    isErsh: !muted.chop && (row.chop?.isErsh ?? false),
                     reasons: b.reasons.slice(0, 4),
                     price: row.price,
                     ts: now,

@@ -12,10 +12,10 @@ import {
 import { fetchKlines, fetchTickers, pMap, fetchBingxPremium, fetchBingxOI, fetchBingxTaker, fetchOkxFunding, fetchOkxOI, fetchBitgetOI, fetchSpotPrices, fetchWhaleTrades, fetchOrderbook, fetchTape, fetchOkxLiquidations, fetchLsr, fetchFundingIntervals, normalizeFunding, type Book, type SpotMap, type TapeTrade, type WhaleInfo, type LiqInfo, type LsrInfo, type FundingIntervals } from './exchanges';
 import { assetClassMap, classifySymbol, type AssetClass, type AssetClassFilter } from './assetClass';
 import { computeScore, detectSweep, execSpreadPct, natrPct, volumeZ, cvdProxy, btcCorr } from './score';
-import { detectBreakout, detectChop, detectDistribution, CHOP_ER_MAX } from './setups';
+import { detectBreakout, detectChop, detectDistribution, BREAKOUT_ALERT, CHOP_ER_MAX } from './setups';
 import { amihudPct, algoProxyOf, analyzeBook, analyzeTape, assembleDeep, illiqProxyOf } from './liquidity';
 import { seriesStore, appendJournal, journalSummary, appendSnapshot, symbolReputation, warmupSeries, scheduleSeriesPersist } from './store';
-import { appendPattern, resolvePending } from './patterns';
+import { appendPattern, resolvePending, RECORD_THR } from './patterns';
 import { autoPaper } from './paper';
 import { getMarketPulse } from './market';
 
@@ -27,11 +27,11 @@ const KLINES_TTL = 45_000;
 const OI_TTL = 180_000;
 const FUNDING_TTL = 300_000;
 const OI_HISTORY_TTL = 300_000;
-const JOURNAL_THRESHOLD = 0.25; // % — порог для записи в журнал
-/* Готовность к пробою, с которой сигнал считается состоявшимся: один порог и для
-   записи в историю паттернов, и для SSE-алерта. Разные пороги означали бы, что
-   win-rate во вкладке «История» посчитан не по тем сигналам, которые приходят в алертах. */
-export const BREAKOUT_ALERT = 60;
+/* Порог записи в журнал и в историю спред-паттерна — одна константа из patterns.ts,
+   потому что это граница популяции, по которой считается win-rate, и подпись под ним
+   обязана читать ровно её. */
+const JOURNAL_THRESHOLD = RECORD_THR.spreadNetPct;
+export { BREAKOUT_ALERT };
 const JOURNAL_COOLDOWN = 10 * 60 * 1000;
 
 interface CacheGlobal {
@@ -293,6 +293,39 @@ function dropMismatchedVenues(agg: Map<string, { symbol: string; per: Map<Exchan
   }
 }
 
+/* ---------------- Граница популяции: что вообще является инструментом скринера ----
+
+   Скринер измеряет бессрочные контракты, котируемые в USDT. Биржи отдают в тех же
+   списках тикеров ещё три вида инструментов, и каждый из них ломает измерение
+   по-своему:
+
+     квота не USDT (BTCUSDC, BCHUSD, BNBUSD1, байбитовские BTCPERP) — цена в другой
+       валюте. ETHPERP котируется в USDC и сравнивался с ETHUSDT: «межбиржевой спред»
+       на нём был базисом USDC/USDT, а не разрывом между биржами;
+     датированные поставочные (BTCUSDT-25DEC26) — другой контракт с собственным
+       базисом к перпу, и чем дальше экспирация, тем больше разрыв;
+     стейбл к стейблу (USDCUSDT) — цена приклеена к единице: такой инструмент не
+       может дать ни один измеряемый исход, но исправно занимает место в выборке.
+
+   Правило проверено на ПОЛНОЙ живой популяции (2099 нормализованных тикеров с пяти
+   бирж, 2026-09-10), а не на случаях, которые его породили: 239 тикеров с неUSDT-квотой
+   (включая все 40 датированных), 4 стейбла к стейблу — 11.6% универсума. Ложных
+   срабатываний на этой популяции нет; USDGOUSDT (настоящий токен) и USDJPYUSDT
+   (форекс — дело классификатора класса актива) под правило НЕ попадают. */
+const STABLE_BASES = new Set([
+  // наблюдены в живом универсуме 2026-09-10
+  'USDC', 'USDE', 'USD1', 'RLUSD',
+  // того же семейства, пока не листятся: добавлены заранее, чтобы листинг не попал в выборку
+  'FDUSD', 'TUSD', 'DAI', 'BUSD', 'USDP', 'PYUSD', 'USDD', 'USDS',
+]);
+
+/** Незнакомый тикер считается пригодным намеренно: спрятанная монета — потерянный
+    сигнал, которого не видно, лишняя строка видна по имени и правится списком. */
+function isScreenableSymbol(symbol: string): boolean {
+  if (!symbol.endsWith('USDT')) return false; // чужая квота, PERP-суффикс, датированные
+  return !STABLE_BASES.has(symbol.slice(0, -4));
+}
+
 function selectUniverse<T extends { maxTurnover: number }>(candidates: T[], top: number, uni: Universe): T[] {
   const sorted = [...candidates].sort((x, y) => y.maxTurnover - x.maxTurnover);
   if (uni.sampling !== 'stratified' || sorted.length <= top) return sorted.slice(0, top);
@@ -382,6 +415,20 @@ async function doScan(
     console.error('[scan] справочник классов недоступен, класс не фильтруется:', e);
     return new Map<string, AssetClass>();
   });
+  /* Граница популяции применяется ДО фильтра класса и независимо от него: чужая квота,
+     датированный контракт и стейбл к стейблу непригодны при любом значении assetClass. */
+  let excludedAsNonPerp = 0;
+  const nonPerpExamples: string[] = [];
+  for (const sym of [...agg.keys()]) {
+    if (isScreenableSymbol(sym)) continue;
+    agg.delete(sym);
+    excludedAsNonPerp += 1;
+    if (nonPerpExamples.length < 5) nonPerpExamples.push(sym);
+  }
+  if (excludedAsNonPerp) {
+    console.warn(`[scan] не инструменты скринера: ${excludedAsNonPerp} (${nonPerpExamples.join(', ')})`);
+  }
+
   const classOf = (s: string): AssetClass => classifySymbol(s, clsMap);
   let excludedByClass = 0;
   if (assetClass !== 'all' && clsMap.size > 0) {
@@ -810,7 +857,7 @@ async function doScan(
 
     // история паттернов: свип / киты / фандинг
     const bestP = [...a.per.entries()].sort((x, y) => y[1].turnover - x[1].turnover)[0];
-    if (sweepBest && sweepBest.ageMin <= 5 && (volZMax ?? 0) >= 1.5) {
+    if (sweepBest && sweepBest.ageMin <= RECORD_THR.sweepMaxAgeMin && (volZMax ?? 0) >= RECORD_THR.sweepMinVolZ) {
       appendPattern({
         ts: now,
         symbol: a.symbol,
@@ -825,7 +872,7 @@ async function doScan(
         netPct: netSpreadPct != null ? Number(netSpreadPct.toFixed(3)) : null,
       });
     }
-    if (wh && Math.abs(wh.netUsd) >= 300_000) {
+    if (wh && Math.abs(wh.netUsd) >= RECORD_THR.whaleNetUsd) {
       appendPattern({
         ts: now,
         symbol: a.symbol,
@@ -838,7 +885,7 @@ async function doScan(
         whaleUsd: Math.round(wh.netUsd),
       });
     }
-    if (fundingAbs != null && fundingAbs >= 0.001 && fundingVals.length) {
+    if (fundingAbs != null && fundingAbs >= RECORD_THR.fundingAbs && fundingVals.length) {
       const signedFund = fundingVals.reduce((x, y) => (Math.abs(y) > Math.abs(x) ? y : x), 0);
       appendPattern({
         ts: now,
@@ -1160,6 +1207,7 @@ async function doScan(
     assetClass,
     // скачок этого числа = биржа изменила состав инструментов
     excludedByClass,
+    excludedAsNonPerp,
     statuses,
     errors,
     refExchange: refExchangePref === 'auto' ? 'auto' : refExchangePref,

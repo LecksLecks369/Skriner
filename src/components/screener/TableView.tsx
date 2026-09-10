@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { CoinRow } from '@/lib/screener/types';
+import { BREAKOUT_MAX_DIST_ATR } from '@/lib/screener/setups';
 import type { Filters } from './useScreener';
 import {
   ExchangeBadges,
@@ -130,7 +131,7 @@ const COLS: Array<{ key: string; label: string; title: string; cls?: string }> =
   { key: 'symbol', label: 'Монета', title: 'Символ + покрытие биржами' },
   { key: 'price', label: 'Цена', title: 'Медианная цена', cls: 'hidden lg:table-cell' },
   { key: 'score', label: 'Скор', title: 'Композитный скор 0–100 (волатильность, OI, свипы, спред, мультибиржевость, фандинг)' },
-  { key: 'breakout', label: 'Пробой', title: 'Готовность к пробою 0–100: сжатие волатильности + прижатие к границе диапазона + набор OI + агрессия в сторону выхода. Стрелка — сторона уровня. Сигналом считается только цена в пределах 0.5 ATR от уровня и ДО выхода за него: дальше 0.5 ATR матожидание измерено отрицательным (−0.284%, интервал целиком ниже нуля), после выхода это уже не прогноз. В обоих случаях — прочерк' },
+  { key: 'breakout', label: 'Пробой', title: `Готовность к пробою 0–100: сжатие волатильности + прижатие к границе диапазона + набор OI + агрессия в сторону выхода. Стрелка — сторона уровня. Сигналом считается только цена в пределах ${BREAKOUT_MAX_DIST_ATR} ATR от уровня и ДО выхода за него: дальше цене до границы ещё идти, после выхода это уже не прогноз. В обоих случаях — прочерк` },
   { key: 'chop', label: 'Ёрш', title: 'Пила: низкий коэффициент эффективности, свечи с длинными тенями, стопы снимают с обеих сторон. В такой монете пробои чаще ложные — сигнал пробоя штрафуется' },
   { key: 'dist', label: 'Раздача', title: 'Расхождение потока и цены внутри пампа/дампа: рост на падающем OI, продажи в рост, толпа набилась в ту же сторону. Контр-сигнал против движения' },
   { key: 'spread', label: 'Спред', title: 'Межбиржевой спред (max-min)/mid' },
@@ -302,7 +303,7 @@ export function TableView({
                         {r.breakout.score}
                       </span>
                     ) : (
-                      <span className="text-zinc-700" title={r.breakout?.fired ? 'цена уже вышла за уровень — не прогноз' : r.breakout ? `до уровня ${r.breakout.distAtr} ATR — дальше 0.5 ATR сигнал не выдаётся` : 'нет диапазона для уровня'}>
+                      <span className="text-zinc-700" title={r.breakout?.fired ? 'цена уже вышла за уровень — не прогноз' : r.breakout ? `до уровня ${r.breakout.distAtr} ATR — дальше ${BREAKOUT_MAX_DIST_ATR} ATR сигнал не выдаётся` : 'нет диапазона для уровня'}>
                         —
                       </span>
                     )}

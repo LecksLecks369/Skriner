@@ -110,6 +110,71 @@ export function wilsonInterval(wins: number, n: number, z = 1.96): { lo: number;
  * исходы выйдут из окна. Запись сигналов при этом НЕ прекращается — иначе выключенный
  * паттерн лишился бы данных, по которым только и мог бы реабилитироваться.
  */
+/**
+ * Отчёт по эджу для паттерна, у которого исход — попадание/промах, а не P&L.
+ * Такому паттерну нельзя приписать матожидание: он не предлагает сделку, поэтому
+ * «прибыли» у него нет и выдумывать её нельзя. Но затвор ему нужен ровно так же —
+ * просто в его собственных единицах, и мерить его надо ПРОТИВ БАЗОВОЙ ЧАСТОТЫ.
+ *
+ * baseRate — доля произвольных окон популяции, в которых исход выполняется сам собой.
+ * Без неё win-rate неинтерпретируем: 10% попаданий при базовой частоте 10% — это ноль
+ * информации, а не слабый результат.
+ *
+ *   выборка меньше EDGE_MIN_N          → 'insufficient';
+ *   весь интервал Уилсона ниже базовой → 'negative', паттерн выключается;
+ *   весь интервал выше базовой         → 'positive';
+ *   базовая внутри интервала           → 'inconclusive'.
+ *
+ * hits — исходы В ХРОНОЛОГИЧЕСКОМ ПОРЯДКЕ; окно то же, что у computeEdge.
+ */
+export function computeRateEdge(hits: boolean[], baseRate: number): EdgeReport {
+  const nTotal = hits.length;
+  const win = hits.slice(-EDGE_WINDOW);
+  const n = win.length;
+  const pct = (v: number) => Math.round(v * 1000) / 1000;
+  const basePct = Math.round(baseRate * 1000) / 10;
+  const out: EdgeReport = {
+    n,
+    nTotal,
+    expectancyPct: null, // не определено: сделки нет
+    ciLoPct: null,
+    ciHiPct: null,
+    winRate: null,
+    winLoPct: null,
+    winHiPct: null,
+    profitFactor: null,
+    sumPnlPct: null,
+    verdict: 'insufficient',
+    muted: false,
+    reason: `нужно ${EDGE_MIN_N} исходов, есть ${n}`,
+  };
+  if (!n) return out;
+
+  const wins = win.filter(Boolean).length;
+  const wr = wilsonInterval(wins, n);
+  out.winRate = pct(wins / n);
+  out.winLoPct = wr ? pct(wr.lo) : null;
+  out.winHiPct = wr ? pct(wr.hi) : null;
+
+  if (n < EDGE_MIN_N) return out;
+  if (wr && wr.hi < baseRate) {
+    out.verdict = 'negative';
+    out.muted = true;
+    out.reason = `${Math.round((wins / n) * 100)}% попаданий (интервал до ${Math.round(wr.hi * 100)}%, n=${n}) — ниже базовой частоты ${basePct}%: сигнал хуже её отсутствия`;
+    return out;
+  }
+  if (wr && wr.lo > baseRate) {
+    out.verdict = 'positive';
+    out.reason = `${Math.round((wins / n) * 100)}% попаданий (интервал от ${Math.round(wr.lo * 100)}%, n=${n}) — выше базовой частоты ${basePct}%`;
+    return out;
+  }
+  out.reason = wr
+    ? `${Math.round((wins / n) * 100)}% попаданий, интервал [${Math.round(wr.lo * 100)}%; ${Math.round(wr.hi * 100)}%] накрывает базовую частоту ${basePct}% при n=${n} — эдж не доказан`
+    : `n=${n}`;
+  out.verdict = 'inconclusive';
+  return out;
+}
+
 export function computeEdge(pnls: number[]): EdgeReport {
   const nTotal = pnls.length;
   const win = pnls.slice(-EDGE_WINDOW);

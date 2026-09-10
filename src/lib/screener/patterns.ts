@@ -22,7 +22,7 @@ import path from 'path';
 import type { Candle, ExchangeId } from './types';
 import { fetchKlines } from './exchanges';
 import { seriesStore } from './store';
-import { CHOP_ER_MAX } from './setups';
+import { BREAKOUT_ALERT, CHOP_BASE_RATE, CHOP_ER_MAX, CHOP_SCORE_MIN } from './setups';
 import {
   arbConvergeLevelPct,
   arbFeesPct,
@@ -31,7 +31,7 @@ import {
   directionalCostPct,
   feePairPct,
 } from './costs';
-import { computeEdge, type EdgeReport } from './edge';
+import { computeEdge, computeRateEdge, type EdgeReport } from './edge';
 
 export type PatternKind = 'spread' | 'robot' | 'sweep' | 'whale' | 'funding' | 'breakout' | 'distribution' | 'chop';
 
@@ -102,6 +102,13 @@ export interface PatternOutcome {
   costSlipModeled?: boolean; // false = проскальзывание не учтено (только комиссии), результат завышен
   erAfter?: number | null; // «ёрш»: эффективность хода на будущем окне — та же величина, что и в детекторе
   erThrUsed?: number; // порог, по которому вынесен вердикт: исходы с другим порогом несравнимы
+  /* Каким путём цены посчитан исход. Это НЕ диагностика, а параметр методики: серии в
+     памяти хранят одну цену за тик (h = l = c), поэтому тейк или стоп, задетые между
+     сэмплами, там не видны и сделка уходит в timeout; клайны несут настоящие high/low.
+     Пока ветка не записана, обе попадают в один win-rate и расслоить его нечем, а
+     пропорция смеси задаётся доступностью данных — величиной, которая коррелирует с
+     ликвидностью и аптаймом. У исходов, записанных до появления поля, оно пустое. */
+  src?: 'series' | 'klines';
 }
 
 /* ---------------- Хранилище ---------------- */
@@ -113,6 +120,77 @@ const MAX_SIGNALS = 3000;
 const HORIZON_MS = 30 * 60 * 1000;
 const EXPIRE_MS = 6 * 3600 * 1000;
 const RESOLVE_BATCH = 10; // максимум дооценок за вызов (лимит API-нагрузки)
+
+/* Пороги ЗАПИСИ в журнал. Живут здесь, рядом с WIN_THR, а не в scan.ts, потому что
+   порог записи — это граница популяции, по которой считается win-rate, а не деталь
+   скана. Подпись под цифрой в «Истории» выводится из этих же констант: подпись,
+   переписанная руками, расходится с кодом молча и ровно тогда, когда порог двигают. */
+export const RECORD_THR = {
+  /** нетто-спред, с которого спред-сигнал попадает в журнал, % */
+  spreadNetPct: 0.25,
+  /** |ставка фандинга| за интервал */
+  fundingAbs: 0.001,
+  /** |нетто-поток китов| за окно, $ */
+  whaleNetUsd: 300_000,
+  /** свип старше этого в журнал не идёт, мин */
+  sweepMaxAgeMin: 5,
+  /** z-score объёма на свипе */
+  sweepMinVolZ: 1.5,
+} as const;
+
+/**
+ * Граница популяции для каждого типа: при каком условии сигнал вообще попал в журнал,
+ * и совпадает ли это условие с тем, по которому шлётся алерт.
+ *
+ * Зачем в выдаче: win-rate описывает выборку, а не рынок, и без условия отбора он
+ * неинтерпретируем. Отдельно важен alertScope — у спреда порог записи фиксирован
+ * (RECORD_THR.spreadNetPct), а порог алерта задаёт пользователь, поэтому цифра в
+ * «Истории» посчитана НЕ по тем сигналам, которые до него доехали, и утверждать
+ * обратное нельзя. У свипа, китов и фандинга алерта нет вовсе — это только журнал.
+ */
+export type AlertScope = 'same' | 'differs' | 'none';
+export const PATTERN_POPULATION: Record<PatternKind, { population: string; alertScope: AlertScope; alertNote: string }> = {
+  spread: {
+    population: `нетто-спред ≥ ${RECORD_THR.spreadNetPct}% · не чаще раза в 10 мин на символ`,
+    alertScope: 'differs',
+    alertNote: 'порог алерта задаётся в настройках отдельно — win-rate посчитан по всем записанным сигналам, а не по доехавшим до алерта',
+  },
+  robot: {
+    population: 'алго-паттерн «робот в неликвиде» по стакану и ленте',
+    alertScope: 'same',
+    alertNote: 'алерт по тому же условию',
+  },
+  sweep: {
+    population: `свип не старше ${RECORD_THR.sweepMaxAgeMin} мин · z объёма ≥ ${RECORD_THR.sweepMinVolZ}`,
+    alertScope: 'none',
+    alertNote: 'алерта нет — только журнал',
+  },
+  whale: {
+    population: `|нетто-поток китов| ≥ $${(RECORD_THR.whaleNetUsd / 1000).toFixed(0)}k`,
+    alertScope: 'none',
+    alertNote: 'алерта нет — только журнал',
+  },
+  funding: {
+    population: `|фандинг| ≥ ${(RECORD_THR.fundingAbs * 100).toFixed(2)}% за интервал`,
+    alertScope: 'none',
+    alertNote: 'алерта нет — только журнал',
+  },
+  breakout: {
+    population: `готовность ≥ ${BREAKOUT_ALERT} и цена ещё не вышла за уровень`,
+    alertScope: 'same',
+    alertNote: 'один порог на запись и на алерт',
+  },
+  distribution: {
+    population: 'поток разошёлся с ценой (направление раздачи/набора определено)',
+    alertScope: 'same',
+    alertNote: 'алерт по тому же условию',
+  },
+  chop: {
+    population: `скор ершистости ≥ ${CHOP_SCORE_MIN} и ER ≤ ${CHOP_ER_MAX} (p10 популяции) · базовая частота исхода ${Math.round(CHOP_BASE_RATE * 100)}%`,
+    alertScope: 'same',
+    alertNote: 'едет пометкой внутри алерта пробоя, по тому же условию',
+  },
+};
 
 /** Тейк-профит: на сколько % в сторону сигнала сделка считается отработавшей */
 export const WIN_THR: Record<PatternKind, number> = {
@@ -229,8 +307,14 @@ function loadOutcomes(): Record<string, PatternOutcome> {
         }
         pst.outcomes[key] = oc;
       }
+      /* Счётчик отброшенного — не санитарная статистика, а отчёт о дефекте писателя.
+         В установившемся режиме он обязан быть нулём: всё, что здесь выбрасывается,
+         кто-то выше по течению продолжает производить, и работа делается впустую. */
       if (dropped) {
-        console.warn(`[patterns] исходов старой методики отброшено: ${dropped} (будут пересчитаны по правилу выхода)`);
+        console.warn(
+          `[patterns] ДЕФЕКТ: исходов несравнимой методики отброшено при загрузке: ${dropped}. ` +
+            `В установившемся режиме здесь должен быть 0 — значит, resolvePending всё ещё их пишет.`
+        );
       }
     }
   } catch {
@@ -542,33 +626,51 @@ export async function resolvePending(): Promise<number> {
     for (const sig of pending) {
       try {
         let oc: PatternOutcome | null = null;
+        /* Сигнал, оценить который нечем В ПРИНЦИПЕ (не «пока нечем»): ждать нет смысла,
+           помечаем истёкшим сразу, иначе он висит в очереди до EXPIRE_MS и занимает батч. */
+        let unresolvable = false;
+        /** Пометить исход веткой, которая его посчитала */
+        const from = (o: PatternOutcome | null, src: 'series' | 'klines'): PatternOutcome | null => {
+          if (o) o.src = src;
+          return o;
+        };
         if (sig.pattern === 'spread' && (sig.netPct != null || sig.spreadPct != null)) {
-          oc = simulateSpreadTrade(sig, spreadPathFromSeries(sig.symbol));
+          oc = from(simulateSpreadTrade(sig, spreadPathFromSeries(sig.symbol)), 'series');
           if (!oc) {
             const path = await spreadPathFromKlines(sig);
-            if (path) oc = simulateSpreadTrade(sig, path);
+            if (path) oc = from(simulateSpreadTrade(sig, path), 'klines');
           }
         } else if (sig.pattern === 'chop') {
-          const erMax = sig.erThr && sig.erThr > 0 ? sig.erThr : 0.32;
-          oc = evalChopPersist(seriesPath(sig.symbol, sig.ex), sig.price, sig.ts, erMax);
-          if (!oc && sig.ex && sig.native) {
-            const path = await klinesPath(sig.ex, sig.native);
-            if (path) oc = evalChopPersist(path, sig.price, sig.ts, erMax);
+          /* Порог берётся ТОЛЬКО из самого сигнала. Подставлять сюда константу нельзя:
+             прежний дефолт 0.32 — снятый порог, и исход, посчитанный по нему, загрузчик
+             всё равно выбросит как несравнимый. Получался вечный цикл: оценить → записать →
+             выбросить при следующей загрузке → оценить снова, и всё это в начале очереди,
+             потому что pending сортируется по возрастанию ts. Сигнал, записанный до
+             появления параметра, оценке не подлежит — так и помечаем. */
+          const erMax = sig.erThr && sig.erThr > 0 ? sig.erThr : null;
+          if (erMax == null) {
+            unresolvable = true;
+          } else {
+            oc = from(evalChopPersist(seriesPath(sig.symbol, sig.ex), sig.price, sig.ts, erMax), 'series');
+            if (!oc && sig.ex && sig.native) {
+              const path = await klinesPath(sig.ex, sig.native);
+              if (path) oc = from(evalChopPersist(path, sig.price, sig.ts, erMax), 'klines');
+            }
           }
         } else if (sig.dir !== 'arb') {
           const tp = WIN_THR[sig.pattern] ?? 0.4;
           const sl = STOP_THR[sig.pattern] ?? tp;
           const cost = directionalCostPct(sig.ex); // круг тейкером на бирже сигнала
           // 1) серии в памяти (покрывают до ~9ч при живом сервере)
-          oc = evalDirectional(seriesPath(sig.symbol, sig.ex), sig.price, sig.dir, sig.ts, tp, sl, cost);
+          oc = from(evalDirectional(seriesPath(sig.symbol, sig.ex), sig.price, sig.dir, sig.ts, tp, sl, cost), 'series');
           // 2) клайны биржи сигнала (покрывают ~85 минут назад)
           if (!oc && sig.ex && sig.native) {
             const path = await klinesPath(sig.ex, sig.native);
-            if (path) oc = evalDirectional(path, sig.price, sig.dir, sig.ts, tp, sl, cost);
+            if (path) oc = from(evalDirectional(path, sig.price, sig.dir, sig.ts, tp, sl, cost), 'klines');
           }
         }
         if (!oc) {
-          if (now - sig.ts > EXPIRE_MS) {
+          if (unresolvable || now - sig.ts > EXPIRE_MS) {
             oc = { ts: now, mfePct: null, maePct: null, movePct: null, win: null, expired: true };
           } else {
             continue; // ещё есть шанс дооценить позже
@@ -611,6 +713,15 @@ export interface PatternStat {
   avgCostPct: number | null; // средние издержки круга на сделку, %
   sumPnlPct: number | null; // суммарный pnl по разрешённым сделкам, %
   byExit: { tp: number; sl: number; timeout: number; converged: number }; // чем закрывались сделки
+  /* Чем посчитаны исходы. Две ветки — две методики (серии слепы к теням внутри тика),
+     поэтому доля здесь читается как состав выборки, а не как справка о работе кэша.
+     unknown — исходы, записанные до появления поля. */
+  bySrc: { series: number; klines: number; unknown: number };
+  /* Условие, при котором сигнал попал в журнал. Win-rate относится ровно к этому
+     множеству: без границы отбора он описывает неизвестно что. */
+  population: string;
+  alertScope: AlertScope;
+  alertNote: string;
   avgMaeWin: number | null; // средняя просадка у выигравших, % — цена, которую пришлось пересидеть
   edge: EdgeReport; // матожидание с доверительным интервалом, вердикт и флаг выключения
 }
@@ -634,6 +745,32 @@ function pnlSequences(): Record<PatternKind, number[]> {
   return seq;
 }
 
+/* Паттерны, исход которых — попадание, а не P&L: матожидания у них нет, и затвор по
+   доверительному интервалу матожидания для них НЕ РАБОТАЕТ — pnlSequences их пропускает,
+   выборка выходит нулевой, вердикт вечно 'insufficient', и худший детектор оказывается
+   единственным, кого механизм автоотключения не трогает вовсе. Поэтому у них свой затвор,
+   в своих единицах и против своей базовой частоты. Значение — доля произвольных окон
+   популяции, в которых исход выполняется сам собой. */
+const RATE_BASELINE: Partial<Record<PatternKind, number>> = {
+  chop: CHOP_BASE_RATE,
+};
+
+/**
+ * Попадания по каждому типу из RATE_BASELINE, в хронологическом порядке.
+ * Фильтр тот же, что у pnlSequences: истёкшие (win == null) — отсутствие данных, а не промах.
+ */
+function hitSequences(): Record<PatternKind, boolean[]> {
+  const arr = loadSignals();
+  const out = loadOutcomes();
+  const seq = Object.fromEntries(ALL_KINDS.map((k) => [k, [] as boolean[]])) as Record<PatternKind, boolean[]>;
+  for (const s of arr) {
+    const oc = out[s.key];
+    if (!oc || oc.win == null) continue;
+    seq[s.pattern]?.push(oc.win);
+  }
+  return seq;
+}
+
 /* Отчёты пересчитываются не чаще раза в 30с: бутстрэп — 2000 ресэмплов на паттерн,
    а isPatternMuted вызывается на каждом сигнале в потоке алертов. Кэш инвалидируется
    и по времени, и по числу записей, чтобы свежая дооценка исходов не ждала минуту. */
@@ -648,7 +785,13 @@ export function patternEdges(): Record<PatternKind, EdgeReport> {
     return edgeCache.v;
   }
   const seq = pnlSequences();
-  const v = Object.fromEntries(ALL_KINDS.map((k) => [k, computeEdge(seq[k])])) as Record<PatternKind, EdgeReport>;
+  const hits = hitSequences();
+  const v = Object.fromEntries(
+    ALL_KINDS.map((k) => {
+      const base = RATE_BASELINE[k];
+      return [k, base != null ? computeRateEdge(hits[k], base) : computeEdge(seq[k])];
+    })
+  ) as Record<PatternKind, EdgeReport>;
   edgeCache = { ts: Date.now(), signals: nSig, outcomes: nOut, v };
   return v;
 }
@@ -692,6 +835,7 @@ export function patternStats(): { stats: PatternStat[]; anyWaiting: number } {
     let costSum = 0;
     let costN = 0;
     const byExit = { tp: 0, sl: 0, timeout: 0, converged: 0 };
+    const bySrc = { series: 0, klines: 0, unknown: 0 };
     for (const s of sigs) {
       const oc = out[s.key];
       if (!oc) {
@@ -703,6 +847,7 @@ export function patternStats(): { stats: PatternStat[]; anyWaiting: number } {
         continue;
       }
       resolved++;
+      bySrc[oc.src ?? 'unknown']++;
       if (oc.exit) byExit[oc.exit]++;
       if (oc.pnlPct != null) {
         pnlSum += oc.pnlPct;
@@ -751,6 +896,8 @@ export function patternStats(): { stats: PatternStat[]; anyWaiting: number } {
       avgCostPct: costN ? Math.round((costSum / costN) * 1000) / 1000 : null,
       sumPnlPct: pnlN ? Math.round(pnlSum * 1000) / 1000 : null,
       byExit,
+      bySrc,
+      ...PATTERN_POPULATION[k],
       avgMaeWin: maeWinN ? Math.round((maeWinSum / maeWinN) * 100) / 100 : null,
       edge: edges[k],
     };
