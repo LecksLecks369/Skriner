@@ -1,6 +1,6 @@
 import type { AssetClass, AssetClassFilter } from './assetClass';
 
-export type ExchangeId = 'bybit' | 'bingx' | 'okx' | 'bitget' | 'mexc' | 'ourbit';
+export type ExchangeId = 'bybit' | 'binance' | 'bingx' | 'okx' | 'bitget' | 'mexc' | 'ourbit';
 
 export interface ExchangeInfo {
   id: ExchangeId;
@@ -16,6 +16,7 @@ export interface ExchangeInfo {
    где считается стоимость круга. */
 export const EXCHANGES: ExchangeInfo[] = [
   { id: 'bybit', name: 'Bybit', takerFee: 0.00055, makerFee: 0.0002, color: '#f7a600' },
+  { id: 'binance', name: 'Binance', takerFee: 0.0005, makerFee: 0.0002, color: '#f0b90b' },
   { id: 'bingx', name: 'BingX', takerFee: 0.0005, makerFee: 0.0002, color: '#2f6bff' },
   { id: 'okx', name: 'OKX', takerFee: 0.0005, makerFee: 0.0002, color: '#8cc63f' },
   { id: 'bitget', name: 'Bitget', takerFee: 0.0006, makerFee: 0.0002, color: '#00f0ff' },

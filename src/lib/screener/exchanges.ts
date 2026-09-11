@@ -39,12 +39,22 @@ export function normalizeSymbol(ex: ExchangeId, native: string): string {
 }
 
 /* ---------------- BYBIT ---------------- */
+/* Общий таймаут 9с отсеивал Bybit в половине циклов: её дамп тикеров самый
+   тяжёлый (≈650 КБ на 873 контракта), и на медленном канале время ответа
+   ложится прямо на границу. Замер реального вызова с реальным таймаутом:
+   4 отказа из 8 (9032/9002/9010/9010 мс — abort), у okx/bitget/mexc 0 из 8.
+   Прогретое соединение отвечает за 3,7–7,5с, холодное — дольше, наблюдался
+   пик 17,2с. 20с покрывают распределение и остаются внутри TICKERS_TTL (30с).
+   Единый порог поверх бирж с разным весом ответа — это не предохранитель,
+   а необъявленный фильтр против самых крупных участников сравнения. */
+const BYBIT_TICKERS_TIMEOUT_MS = 20_000;
+
 async function fetchBybit(): Promise<ExchangeFetchResult> {
   const t0 = Date.now();
   const j = await fetchJson<{
     retCode: number;
     result?: { list?: Array<Record<string, string>> };
-  }>('https://api.bybit.com/v5/market/tickers?category=linear');
+  }>('https://api.bybit.com/v5/market/tickers?category=linear', BYBIT_TICKERS_TIMEOUT_MS);
   if (j.retCode !== 0 || !j.result?.list) throw new Error('bybit retCode!=0');
   const tickers: RawTicker[] = [];
   for (const t of j.result.list) {
@@ -85,6 +95,95 @@ async function fetchBybitKlines(native: string, limit = 90): Promise<Candle[]> {
     }))
     .filter((c) => c.c > 0)
     .reverse();
+}
+
+/* ---------------- BINANCE ----------------
+
+   Своя величина таймаута, как у Bybit, и по той же причине: с этой сети Binance
+   отвечает 2.4-3.0 с на запрос против 0.6 с у Bybit/OKX/Bitget/MEXC (замер
+   2026-09-11), а первый запрос после простоя — 8 с. Под общим порогом 9 с площадка
+   выпадала бы из сравнения по таймауту и выглядела бы заблокированной, хотя
+   отвечает исправно: отказ по чужому порогу неотличим от недоступности. */
+const BINANCE_TIMEOUT_MS = 20_000;
+const BINANCE_FAPI = 'https://fapi.binance.com/fapi/v1';
+
+/* У Binance цена с оборотом, лучшие котировки и фандинг лежат в трёх разных
+   эндпоинтах, поэтому тикеры собираются из трёх ответов. Котировки тут не
+   «дополнительное поле»: без bid/ask строка не участвует в сравнении спредов,
+   ради которого биржа и добавлена. */
+async function fetchBinance(): Promise<ExchangeFetchResult> {
+  const t0 = Date.now();
+  const [t24, books, prems] = await Promise.all([
+    fetchJson<Array<{ symbol: string; lastPrice: string; quoteVolume: string }>>(
+      `${BINANCE_FAPI}/ticker/24hr`,
+      BINANCE_TIMEOUT_MS
+    ),
+    fetchJson<Array<{ symbol: string; bidPrice: string; askPrice: string }>>(
+      `${BINANCE_FAPI}/ticker/bookTicker`,
+      BINANCE_TIMEOUT_MS
+    ),
+    fetchJson<Array<{ symbol: string; lastFundingRate: string; nextFundingTime: number }>>(
+      `${BINANCE_FAPI}/premiumIndex`,
+      BINANCE_TIMEOUT_MS
+    ),
+  ]);
+  const bookBy = new Map(books.map((b) => [b.symbol, b]));
+  const premBy = new Map(prems.map((p) => [p.symbol, p]));
+
+  const tickers: RawTicker[] = [];
+  for (const t of t24) {
+    const price = parseFloat(t.lastPrice);
+    if (!price || price <= 0) continue;
+    const b = bookBy.get(t.symbol);
+    const p = premBy.get(t.symbol);
+    tickers.push({
+      symbol: normalizeSymbol('binance', t.symbol),
+      nativeSymbol: t.symbol,
+      price,
+      bid: numOrNull(b?.bidPrice),
+      ask: numOrNull(b?.askPrice),
+      turnoverUsd: parseFloat(t.quoteVolume || '0'),
+      fundingRate: p?.lastFundingRate ? parseFloat(p.lastFundingRate) : null,
+      /* OI Binance отдаёт только по одному символу за запрос — догружается точечно
+         для топа в скане, как у OKX и Bitget, а не для всех 766 символов сразу. */
+      oi: null,
+      oiUsd: null,
+      nextFundingTs: p?.nextFundingTime ? Number(p.nextFundingTime) : null,
+    });
+  }
+  return { exchange: 'binance', ok: true, tickers, fetchedAt: Date.now(), lagMs: Date.now() - t0 };
+}
+
+async function fetchBinanceKlines(native: string, limit = 90): Promise<Candle[]> {
+  const j = await fetchJson<Array<Array<string | number>>>(
+    `${BINANCE_FAPI}/klines?symbol=${native}&interval=1m&limit=${limit}`,
+    12_000
+  );
+  // Binance отдаёт старые первыми — разворачивать не нужно
+  return (j || [])
+    .map((r) => ({
+      ts: Number(r[0]),
+      o: parseFloat(String(r[1])),
+      h: parseFloat(String(r[2])),
+      l: parseFloat(String(r[3])),
+      c: parseFloat(String(r[4])),
+      v: parseFloat(String(r[5])),
+      qv: parseFloat(String(r[7])),
+    }))
+    .filter((c) => c.c > 0);
+}
+
+/** OI в монетах (как у остальных площадок); в USD пересчитывается в скане по цене */
+export async function fetchBinanceOI(native: string): Promise<number | null> {
+  try {
+    const j = await fetchJson<{ openInterest?: string }>(
+      `${BINANCE_FAPI}/openInterest?symbol=${native}`,
+      10_000
+    );
+    return numOrNull(j.openInterest);
+  } catch {
+    return null;
+  }
 }
 
 /* ---------------- BINGX ---------------- */
@@ -430,6 +529,9 @@ export async function fetchTickers(ex: ExchangeId): Promise<ExchangeFetchResult>
       case 'bybit':
         res = await fetchBybit();
         break;
+      case 'binance':
+        res = await fetchBinance();
+        break;
       case 'bingx':
         res = await fetchBingx();
         break;
@@ -474,6 +576,8 @@ export async function fetchKlines(
     switch (ex) {
       case 'bybit':
         return { exchange: ex, symbol: native, intervalMin: 1, candles: await fetchBybitKlines(native) };
+      case 'binance':
+        return { exchange: ex, symbol: native, intervalMin: 1, candles: await fetchBinanceKlines(native) };
       case 'bingx':
         return { exchange: ex, symbol: native, intervalMin: 1, candles: await fetchBingxKlines(native) };
       case 'okx':
@@ -636,13 +740,33 @@ export interface Book {
 export interface FundingIntervals {
   bybit: Map<string, number>; // нормализованный символ -> минуты
   bitget: Map<string, number>;
+  binance: Map<string, number>;
 }
 
 /** Интервалы начисления фандинга (в минутах) там, где биржа их публикует */
 export async function fetchFundingIntervals(): Promise<FundingIntervals> {
   const bybit = new Map<string, number>();
   const bitget = new Map<string, number>();
+  const binance = new Map<string, number>();
   await Promise.all([
+    (async () => {
+      /* fundingInfo перечисляет не все символы, а те, по которым биржа считает нужным
+         объявить параметры; отсутствующие начисляются раз в 8 часов — это задокументированный
+         дефолт Binance, а не наша догадка, поэтому ставка всё равно считается нормированной.
+         Дефолт проставляется в скане по факту отсутствия ключа. */
+      try {
+        const j = await fetchJson<Array<{ symbol: string; fundingIntervalHours?: number }>>(
+          `${BINANCE_FAPI}/fundingInfo`,
+          BINANCE_TIMEOUT_MS
+        );
+        for (const t of j || []) {
+          const hours = Number(t.fundingIntervalHours);
+          if (t.symbol && isFinite(hours) && hours > 0) binance.set(normalizeSymbol('binance', t.symbol), hours * 60);
+        }
+      } catch (e) {
+        console.error('[funding-interval] binance:', e instanceof Error ? e.message : e);
+      }
+    })(),
     (async () => {
       try {
         const j = await fetchJson<{ retCode: number; result?: { list?: Array<Record<string, string>> } }>(
@@ -672,7 +796,7 @@ export async function fetchFundingIntervals(): Promise<FundingIntervals> {
       }
     })(),
   ]);
-  return { bybit, bitget };
+  return { bybit, bitget, binance };
 }
 
 /** Ставка, приведённая к 8-часовому периоду — только такие можно сравнивать и складывать */
@@ -691,6 +815,18 @@ export async function fetchOrderbook(ex: ExchangeId, native: string): Promise<Bo
       const lv = (arr?: string[][]): BookLevel[] =>
         (arr || []).map((r) => ({ p: parseFloat(r[0]), s: parseFloat(r[1]) })).filter((l) => l.p > 0 && l.s > 0);
       return { bids: lv(j.result.b), asks: lv(j.result.a) };
+    }
+    if (ex === 'binance') {
+      /* Binance принимает только фиксированный набор глубин (5/10/20/50/100/500/1000),
+         BOOK_LEVELS в него не входит. Берём следующую доступную и срезаем до общего
+         числа уровней: книга, измеренная на другой глубине, несравнима с остальными. */
+      const j = await fetchJson<{ bids?: string[][]; asks?: string[][] }>(
+        `${BINANCE_FAPI}/depth?symbol=${native}&limit=500`, 9000);
+      const lv = (arr?: string[][]): BookLevel[] =>
+        (arr || []).slice(0, BOOK_LEVELS).map((r) => ({ p: parseFloat(r[0]), s: parseFloat(r[1]) })).filter((l) => l.p > 0 && l.s > 0);
+      const bids = lv(j.bids);
+      const asks = lv(j.asks);
+      return bids.length && asks.length ? { bids, asks } : null;
     }
     if (ex === 'bingx') {
       const j = await fetchJson<{ code: number; data?: { bids?: string[][]; asks?: string[][] } }>(
@@ -763,6 +899,21 @@ export async function fetchTape(ex: ExchangeId, native: string): Promise<TapeTra
           const px = parseFloat(t.price);
           const qty = parseFloat(t.size);
           return { ts: Number(t.time), px, qty, usd: px * qty, taker: (t.side === 'Buy' ? 'buy' : 'sell') as 'buy' | 'sell' };
+        })
+        .filter((t) => t.px > 0 && t.qty > 0);
+      out.sort((a, b) => a.ts - b.ts); // старые первыми
+      return out;
+    }
+    if (ex === 'binance') {
+      /* aggTrades: сделки, склеенные по цене и агрессору. m=true означает, что покупатель
+         был мейкером, то есть агрессор — продавец. */
+      const j = await fetchJson<Array<{ T: number; p: string; q: string; m: boolean }>>(
+        `${BINANCE_FAPI}/aggTrades?symbol=${native}&limit=1000`, 10_000);
+      const out = (j || [])
+        .map((t) => {
+          const px = parseFloat(t.p);
+          const qty = parseFloat(t.q);
+          return { ts: Number(t.T), px, qty, usd: px * qty, taker: (t.m ? 'sell' : 'buy') as 'buy' | 'sell' };
         })
         .filter((t) => t.px > 0 && t.qty > 0);
       out.sort((a, b) => a.ts - b.ts); // старые первыми

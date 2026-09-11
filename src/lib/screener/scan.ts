@@ -9,7 +9,7 @@ import {
   type KlinesResult,
   type ScanResponse,
 } from './types';
-import { fetchKlines, fetchTickers, pMap, fetchBingxPremium, fetchBingxOI, fetchBingxTaker, fetchOkxFunding, fetchOkxOI, fetchBitgetOI, fetchSpotPrices, fetchWhaleTrades, fetchOrderbook, fetchTape, fetchOkxLiquidations, fetchLsr, fetchFundingIntervals, normalizeFunding, type Book, type SpotMap, type TapeTrade, type WhaleInfo, type LiqInfo, type LsrInfo, type FundingIntervals } from './exchanges';
+import { fetchKlines, fetchTickers, pMap, fetchBingxPremium, fetchBingxOI, fetchBinanceOI, fetchBingxTaker, fetchOkxFunding, fetchOkxOI, fetchBitgetOI, fetchSpotPrices, fetchWhaleTrades, fetchOrderbook, fetchTape, fetchOkxLiquidations, fetchLsr, fetchFundingIntervals, normalizeFunding, type Book, type SpotMap, type TapeTrade, type WhaleInfo, type LiqInfo, type LsrInfo, type FundingIntervals } from './exchanges';
 import { assetClassMap, classifySymbol, type AssetClass, type AssetClassFilter } from './assetClass';
 import { computeScore, detectSweep, execSpreadPct, natrPct, volumeZ, cvdProxy, btcCorr } from './score';
 import { detectBreakout, detectChop, detectDistribution, BREAKOUT_ALERT, CHOP_ER_MAX } from './setups';
@@ -507,6 +507,17 @@ async function doScan(
           extras.set(a.symbol, m);
         }
       }
+      /* Binance отдаёт OI только по одному символу за запрос — как OKX и Bitget,
+         поэтому догружается здесь же, для топа, а не для всех 766 символов. */
+      const bnP = a.per.get('binance');
+      if (bnP) {
+        const oi = await mapLimitKey(`binance:oi:${bnP.native}`, cache.oi, OI_TTL, () => fetchBinanceOI(bnP.native));
+        if (oi != null) {
+          const m = extras.get(a.symbol) || new Map<ExchangeId, Extra>();
+          m.set('binance', { oi, ...m.get('binance') });
+          extras.set(a.symbol, m);
+        }
+      }
     }),
     ...top40.map(async ({ a }) => {
       if (!a.per.has('bybit')) return;
@@ -630,7 +641,13 @@ async function doScan(
         bid: p.bid,
         ask: p.ask,
         fundingRate: p.funding ?? ext?.funding ?? null,
-        fundingIntervalMin: fundingIntervals[exId as 'bybit' | 'bitget']?.get(a.symbol) ?? null,
+        /* У Binance fundingInfo перечисляет не все символы; отсутствующие начисляются
+           раз в 8 часов — это опубликованный дефолт биржи, поэтому ставка считается
+           нормированной, а не «период неизвестен». Для остальных площадок отсутствие
+           записи по-прежнему означает именно неизвестный период. */
+        fundingIntervalMin:
+          fundingIntervals[exId as 'bybit' | 'bitget' | 'binance']?.get(a.symbol) ??
+          (exId === 'binance' ? 480 : null),
         oiUsd: p.oiUsd ?? (p.oi != null ? p.oi * p.price : ext?.oi != null ? ext.oi * p.price : null),
         dOiPct5m: null,
         dOiPct15m: d15,
