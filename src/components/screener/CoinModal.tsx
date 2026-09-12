@@ -48,6 +48,10 @@ function AiComment({ symbol }: { symbol: string }) {
   const [text, setText] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  /* Кто написал разбор. Провайдеров теперь несколько (переменные окружения,
+     .z-ai-config, локальный Ollama), они отвечают по-разному, и текст без
+     указания источника нечем воспроизвести и не с чем сравнить. */
+  const [provider, setProvider] = useState<string | null>(null);
 
   const ask = async (force = false) => {
     setBusy(true);
@@ -58,9 +62,11 @@ function AiComment({ symbol }: { symbol: string }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ symbol, force }),
       });
-      const j = (await r.json()) as { comment?: string; error?: string };
-      if (j.comment) setText(j.comment);
-      else setErr(j.error || 'не удалось получить разбор');
+      const j = (await r.json()) as { comment?: string; error?: string; provider?: string };
+      if (j.comment) {
+        setText(j.comment);
+        setProvider(j.provider ?? null);
+      } else setErr(j.error || 'не удалось получить разбор');
     } catch {
       setErr('ошибка сети');
     } finally {
@@ -86,7 +92,12 @@ function AiComment({ symbol }: { symbol: string }) {
         </div>
       </div>
       {text && <p className="mt-2 text-xs leading-relaxed text-zinc-300">{text}</p>}
-      {err && <p className="mt-2 text-xs text-rose-400">{err}</p>}
+      {text && provider && (
+        <p className="mt-1 text-[10px] text-zinc-600">
+          модель: {provider} · текст порождён языковой моделью по числам строки, это не проверенный сигнал
+        </p>
+      )}
+      {err && <p className="mt-2 text-xs leading-relaxed text-rose-400">{err}</p>}
     </div>
   );
 }
