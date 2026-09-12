@@ -38,7 +38,7 @@ import {
   directionalCostPct,
   feePairPct,
 } from './costs';
-import { computeEdge, computeRateEdge, wilsonInterval, type EdgeReport } from './edge';
+import { EDGE_WINDOW, computeEdge, computeRateEdge, wilsonInterval, type EdgeReport } from './edge';
 
 export type PatternKind = 'spread' | 'robot' | 'sweep' | 'whale' | 'funding' | 'breakout' | 'distribution' | 'chop';
 
@@ -76,6 +76,14 @@ export interface PatternSignal {
      положительным ровно за счёт пропущенного члена. Отсутствует у монет вне
      deep-топа и у сигналов, записанных до появления поля. */
   slipRoundTripPct?: number | null;
+  /* Цель и стоп, выведенные из волатильности монеты (natrPct ниже) на момент
+     сигнала. Пишутся, чтобы вердикт можно было перепроверить по записи: цель теперь
+     своя у каждой монеты, и пересчёт её при дооценке дал бы другое число. */
+  tpPct?: number;
+  slPct?: number;
+  /* Доля улик, прочитанных детектором раздачи (0..1): сигнал по половине улик и
+     сигнал по всем — разные популяции, и без поля их не расслоить. */
+  coverage?: number;
   /* для сетапов движения */
   setupScore?: number; // готовность пробоя / сила раздачи / ершистость
   level?: number; // уровень пробоя
@@ -106,7 +114,12 @@ export interface PatternSignal {
       новыми и отбрасываются загрузчиком. Версия поднята ТОЛЬКО у спреда: остальные
       семь детекторов считаются ровно как раньше, и глобальный бамп выбросил бы их
       историю вместе с вердиктами, которыми они выключены. */
-export const OUTCOME_VERSION = 5;
+/* v6: у направленных паттернов цель и стоп выводятся из волатильности самой монеты
+      (TARGET_ATR_K × NATR × √30), а не из одного числа на всех, и записываются в
+      исход (tpUsed/slUsed). Исходы v≤5 считались фиксированными ±0.4/0.5% — это
+      другая величина, и складывать их с новыми в один win-rate нельзя. У спреда и
+      ерша выражение НЕ менялось, их история сохраняется. */
+export const OUTCOME_VERSION = 6;
 
 /**
  * Минимальная версия, при которой исход сравним с новыми, ПО ТИПАМ.
@@ -124,7 +137,18 @@ export const OUTCOME_VERSION = 5;
  */
 const OUTCOME_MIN_V: Partial<Record<PatternKind, number>> = {
   spread: 5, // издержки круга со слипейджем, а не только комиссии
+  /* Направленные: цель от волатильности монеты вместо фиксированной. Перечислены
+     поимённо, а не через умолчание, чтобы добавленный завтра детектор не унаследовал
+     чужой порог молча. */
+  robot: 6,
+  sweep: 6,
+  whale: 6,
+  funding: 6,
+  breakout: 6,
+  distribution: 6,
 };
+/* Ёрш: выражение исхода (ER на будущем окне против порога) не менялось ни в v5, ни
+   в v6 — его история сравнима и сохраняется. */
 const OUTCOME_MIN_V_DEFAULT = 3;
 
 /** Тип паттерна из ключа исхода (`<pattern>:<symbol>:<ts>`) */
@@ -152,6 +176,13 @@ export interface PatternOutcome {
   costSlipModeled?: boolean; // false = проскальзывание не учтено (только комиссии), результат завышен
   erAfter?: number | null; // «ёрш»: эффективность хода на будущем окне — та же величина, что и в детекторе
   erThrUsed?: number; // порог, по которому вынесен вердикт: исходы с другим порогом несравнимы
+  /* Цель и стоп, по которым вынесен ИМЕННО ЭТОТ вердикт. Записываются по той же
+     причине, что и erThrUsed: цель теперь своя у каждой монеты, и без неё исход
+     нельзя перепроверить по записи. tpFromAtr=false — цель запасная, фиксированная;
+     смешивать такие исходы с масштабированными нельзя. */
+  tpUsed?: number;
+  slUsed?: number;
+  tpFromAtr?: boolean;
   /* Каким путём цены посчитан исход. Это НЕ диагностика, а параметр методики: серии в
      памяти хранят одну цену за тик (h = l = c), поэтому тейк или стоп, задетые между
      сэмплами, там не видны и сделка уходит в timeout; клайны несут настоящие high/low.
@@ -325,7 +356,49 @@ export const PATTERN_POPULATION: Record<PatternKind, { population: string; alert
   },
 };
 
-/** Тейк-профит: на сколько % в сторону сигнала сделка считается отработавшей */
+/**
+ * Цель исхода от волатильности САМОЙ МОНЕТЫ, а не одно число на всех.
+ *
+ * Фиксированные ±0.5% измеряют у разных монет разные вопросы. Замер по 80 живым
+ * строкам: NATR 1м имеет медиану 0.121%, p10 = 0.047%, p90 = 0.585% — размах в
+ * двенадцать раз. В единицах типичного получасового хода (NATR × √30) фиксированная
+ * цель 0.5% стоит 0.16 хода для самой тихой десятины и 2.10 хода для самой громкой:
+ * у первых она берётся шумом и «победа» не значит ничего, у вторых недостижима и
+ * сигнал уходит в таймаут. Отсюда и 44% таймаутов у пробоя при почти симметричных
+ * MFE/MAE (медианы 0.149% и 0.136%) — то есть на этих сигналах цена просто бродила.
+ *
+ * ВАЖНО, ЧЕГО ЭТА ПРАВКА НЕ ДЕЛАЕТ. Она не повышает win-rate и не должна: опустить
+ * цель до 0.15% значило бы переводить те же блуждания в «победы», ведь MAE у них
+ * такой же, как MFE. Она делает исходы РАЗНЫХ МОНЕТ сравнимыми между собой — до неё
+ * один win-rate складывал две разные величины.
+ *
+ * k = 0.75 выбран так, чтобы медианная монета получила 0.496% — практически
+ * сегодняшние 0.5%. То есть по центру распределения ничего не меняется, меняются
+ * только хвосты, ради которых правка и делается.
+ */
+export const TARGET_ATR_K = 0.75;
+/** Горизонт в барах 1м — тот же, что HORIZON_MS; √N переводит ATR бара в ход окна */
+const TARGET_HORIZON_BARS = 30;
+/** Границы цели: ниже круга тейкером сделки нет, выше — цель недостижима за окно */
+const TARGET_MIN_PCT = 0.15;
+const TARGET_MAX_PCT = 2.0;
+
+/**
+ * Цель и стоп для направленного сигнала по NATR монеты на момент сигнала.
+ * natrPct отсутствует (монета вне свечного топа) — возвращается запасная
+ * фиксированная пара, и это помечается в исходе, чтобы обе не смешивались.
+ */
+export function directionalTarget(kind: PatternKind, natrPct: number | null | undefined): { tp: number; sl: number; fromAtr: boolean } {
+  const base = WIN_THR[kind] ?? 0.4;
+  if (natrPct == null || !Number.isFinite(natrPct) || natrPct <= 0) {
+    return { tp: base, sl: STOP_THR[kind] ?? base, fromAtr: false };
+  }
+  const raw = TARGET_ATR_K * natrPct * Math.sqrt(TARGET_HORIZON_BARS);
+  const tp = Math.round(Math.min(TARGET_MAX_PCT, Math.max(TARGET_MIN_PCT, raw)) * 1000) / 1000;
+  return { tp, sl: tp, fromAtr: true }; // R:R 1:1 сохраняется
+}
+
+/** Запасной тейк-профит, когда волатильность монеты неизвестна */
 export const WIN_THR: Record<PatternKind, number> = {
   spread: 0, // считается по схлопыванию, не по ходу цены
   robot: 0.5,
@@ -353,14 +426,21 @@ export const STOP_THR: Record<PatternKind, number> = {
 /* COOLDOWN_RAW / COOLDOWN_MS объявлены выше, рядом с RECORD_THR: подпись
    популяции в PATTERN_POPULATION строится из той же константы. */
 
+/* Подписи направленных паттернов собираются из константы цели, а не из чисел в
+   тексте. Пока в них стояли фиксированные ±0.4/0.5%, подпись описывала снятое
+   правило: цель теперь своя у каждой монеты (TARGET_ATR_K × NATR × √30), и
+   переписанный руками процент расходился бы с кодом молча. */
+const dirHint = (what: string) =>
+  `${what} до цели раньше стопа, цель = ${TARGET_ATR_K} × NATR монеты × √30 (медиана ≈0.5%, границы ${TARGET_MIN_PCT}–${TARGET_MAX_PCT}%), минус круг тейкером (30 минут)`;
+
 export const PATTERN_META: Record<PatternKind, { icon: string; name: string; hint: string }> = {
   spread: { icon: '🔀', name: 'Спред', hint: 'сделка на разрыве: прибыль после комиссий круга (30 минут)' },
-  robot: { icon: '🤖', name: 'Робот вошёл', hint: 'тейк +0.5% раньше стопа −0.5%, минус круг тейкером (30 минут)' },
-  sweep: { icon: '🌊', name: 'Свип', hint: 'откат +0.4% раньше стопа −0.4%, минус круг тейкером (30 минут)' },
-  whale: { icon: '🐋', name: 'Киты', hint: 'ход по потоку +0.4% раньше стопа −0.4%, минус круг тейкером (30 минут)' },
-  funding: { icon: '💸', name: 'Фандинг', hint: 'ход против толпы +0.4% раньше стопа −0.4%, минус круг тейкером (30 минут)' },
-  breakout: { icon: '⚡', name: 'Пробой', hint: 'ход в сторону уровня +0.5% раньше стопа −0.5% (30 минут)' },
-  distribution: { icon: '📦', name: 'Раздача', hint: 'разворот против пампа/дампа +0.5% раньше стопа −0.5% (30 минут)' },
+  robot: { icon: '🤖', name: 'Робот вошёл', hint: dirHint('ход в сторону агрессии') },
+  sweep: { icon: '🌊', name: 'Свип', hint: dirHint('откат после снятия ликвидности') },
+  whale: { icon: '🐋', name: 'Киты', hint: dirHint('ход по потоку китов') },
+  funding: { icon: '💸', name: 'Фандинг', hint: dirHint('ход против перегретой толпы') },
+  breakout: { icon: '⚡', name: 'Пробой', hint: dirHint('ход в сторону уровня') },
+  distribution: { icon: '📦', name: 'Раздача', hint: dirHint('разворот против пампа/дампа') },
   chop: {
     icon: '〰',
     name: 'Ёрш',
@@ -495,7 +575,19 @@ export function appendPattern(sig: Omit<PatternSignal, 'key'>): boolean {
   const cooldown = COOLDOWN_MS[sig.pattern] * (quarantined(sig.pattern, sig.symbol) ? QUARANTINE_MULT : 1);
   if (sig.ts - last < cooldown) return false;
   pst.lastTs[ck] = sig.ts;
-  const full: PatternSignal = { ...sig, key: `${sig.pattern}:${sig.symbol}:${sig.ts}` };
+  /* Цель и стоп проставляются ЗДЕСЬ, на единственном пути записи, а не в шести
+     местах скана: иначе один забытый вызов даст сигнал со старой фиксированной
+     целью, и он молча смешается в общий win-rate с масштабированными. Для 'arb' и
+     ненаправленного ерша цели нет — у них своё правило выхода. */
+  const tgt =
+    sig.dir !== 'arb' && sig.pattern !== 'chop' && sig.tpPct == null
+      ? directionalTarget(sig.pattern, sig.natrPct)
+      : null;
+  const full: PatternSignal = {
+    ...sig,
+    ...(tgt && tgt.fromAtr ? { tpPct: tgt.tp, slPct: tgt.sl } : {}),
+    key: `${sig.pattern}:${sig.symbol}:${sig.ts}`,
+  };
   arr.push(full);
   if (arr.length > MAX_SIGNALS) arr.splice(0, arr.length - MAX_SIGNALS);
   try {
@@ -562,7 +654,8 @@ function evalDirectional(
   ts0: number,
   tpPct: number,
   slPct: number,
-  costPct: number
+  costPct: number,
+  tpFromAtr = false
 ): PatternOutcome | null {
   const win = path.filter((p) => p.ts >= ts0 && p.ts <= ts0 + HORIZON_MS);
   if (win.length < 8) return null; // покрытия окна нет — не оцениваем
@@ -612,6 +705,9 @@ function evalDirectional(
     pnlGrossPct: r3(gross),
     costPct: r3(costPct),
     costSlipModeled: false,
+    tpUsed: r3(tpPct),
+    slUsed: r3(slPct),
+    tpFromAtr,
   };
 }
 
@@ -872,15 +968,26 @@ export async function resolvePending(): Promise<number> {
             }
           }
         } else if (sig.dir !== 'arb') {
-          const tp = WIN_THR[sig.pattern] ?? 0.4;
-          const sl = STOP_THR[sig.pattern] ?? tp;
+          /* Цель выводится ИЗ ЗАПИСИ сигнала и только из неё: либо готовая пара
+             tpPct/slPct, либо — у сигналов, записанных до её появления, — из их
+             ЗАПИСАННОЙ волатильности natrPct. Пересчитывать по сегодняшнему NATR
+             нельзя: вердикт перестал бы воспроизводиться из строки журнала. Там, где
+             и natrPct нет, остаётся запасная фиксированная пара, и исход помечается
+             tpFromAtr: false, чтобы две величины не смешались в одном win-rate.
+
+             841 сигнал пробоя из 910 несёт natrPct — их история восстанавливается
+             под сравнимой целью, а не ждёт накопления новых. */
+          const tgt = sig.tpPct != null ? null : directionalTarget(sig.pattern, sig.natrPct);
+          const tp = sig.tpPct ?? tgt!.tp;
+          const sl = sig.slPct ?? tgt!.sl;
           const cost = directionalCostPct(sig.ex); // круг тейкером на бирже сигнала
           // 1) серии в памяти (покрывают до ~9ч при живом сервере)
-          oc = from(evalDirectional(seriesPath(sig.symbol, sig.ex), sig.price, sig.dir, sig.ts, tp, sl, cost), 'series');
+          const fromAtr = sig.tpPct != null || (tgt?.fromAtr ?? false);
+          oc = from(evalDirectional(seriesPath(sig.symbol, sig.ex), sig.price, sig.dir, sig.ts, tp, sl, cost, fromAtr), 'series');
           // 2) клайны биржи сигнала (покрывают ~85 минут назад)
           if (!oc && sig.ex && sig.native) {
             const path = await klinesPath(sig.ex, sig.native);
-            if (path) oc = from(evalDirectional(path, sig.price, sig.dir, sig.ts, tp, sl, cost), 'klines');
+            if (path) oc = from(evalDirectional(path, sig.price, sig.dir, sig.ts, tp, sl, cost, fromAtr), 'klines');
           }
         }
         if (!oc) {
@@ -931,6 +1038,14 @@ export interface PatternStat {
      поэтому доля здесь читается как состав выборки, а не как справка о работе кэша.
      unknown — исходы, записанные до появления поля. */
   bySrc: { series: number; klines: number; unknown: number };
+  /* Какой целью посчитан каждый исход. atr — цель от волатильности самой монеты,
+     fixed — запасная фиксированная (волатильность на момент сигнала неизвестна).
+     Это ДВЕ РАЗНЫЕ ВЕЛИЧИНЫ под одним win-rate, и доля обязана быть видна: у тихой
+     монеты фиксированная цель берётся шумом, у громкой недостижима за окно. */
+  byTarget: { atr: number; fixed: number };
+  /* Медианная цель по выборке, % — чтобы «win-rate 45%» читался вместе с тем, на
+     каком ходе он измерен. null у ненаправленных. */
+  medianTargetPct: number | null;
   /* Условие, при котором сигнал попал в журнал. Win-rate относится ровно к этому
      множеству: без границы отбора он описывает неизвестно что. */
   population: string;
@@ -1038,6 +1153,84 @@ function hitSequences(): Record<PatternKind, { hit: boolean[]; sym: string[] }> 
   return seq;
 }
 
+/* ============ ЗАЛИПАЮЩЕЕ ОТКЛЮЧЕНИЕ ============
+
+   Выключение по отрицательному эджу — чистая функция от окна исходов, и это верно
+   ровно до тех пор, пока окно не опустошается по причинам, не имеющим отношения к
+   рынку. Поднятая версия методики выбрасывает несравнимые исходы — и вместе с ними
+   доказательство, на котором стояло отключение: вердикт становится 'insufficient',
+   а он не выключает. То есть смена формата данных тихо превращается в смену
+   поведения, причём в разрешающую сторону — детектор, измеренный как убыточный,
+   снова начинает слать алерты, и единственным следом остаётся обнулившийся счётчик.
+
+   Поэтому доказанный минус запоминается на диске и держит паттерн выключенным, пока
+   тот не НАБЕРЁТ ЗАНОВО полноценный вердикт. Снимается залипание только вердиктом
+   на новых данных, а не их отсутствием: 'insufficient' его не снимает никогда. */
+interface MuteRecord {
+  since: number; // когда минус был доказан
+  reason: string; // на чём стоял вердикт тогда
+  atVersion: number;
+}
+const MUTES_FILE = path.join(DATA_DIR, 'pattern_mutes.json');
+
+function loadMutes(): Partial<Record<PatternKind, MuteRecord>> {
+  try {
+    if (fs.existsSync(MUTES_FILE)) return JSON.parse(fs.readFileSync(MUTES_FILE, 'utf8'));
+  } catch {
+    /* файл битый — считаем, что залипаний нет; это разрешающая сторона, поэтому
+       ошибка чтения логируется, а не проглатывается */
+    console.warn('[patterns] не прочитан', MUTES_FILE, '— залипшие отключения не применены');
+  }
+  return {};
+}
+
+function saveMutes(m: Partial<Record<PatternKind, MuteRecord>>) {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(MUTES_FILE, JSON.stringify(m, null, 1));
+  } catch {
+    /* диск недоступен — залипание живёт до перезапуска */
+  }
+}
+
+/**
+ * Применяет залипание к свежему отчёту: доказанный минус записывается, вердикт на
+ * достаточной выборке его снимает, недостаток данных — нет.
+ */
+function applySticky(kind: PatternKind, rep: EdgeReport, mutes: Partial<Record<PatternKind, MuteRecord>>): { rep: EdgeReport; changed: boolean } {
+  const prev = mutes[kind];
+  if (rep.verdict === 'negative') {
+    if (!prev) {
+      mutes[kind] = { since: Date.now(), reason: rep.reason, atVersion: OUTCOME_VERSION };
+      return { rep, changed: true };
+    }
+    return { rep, changed: false };
+  }
+  if (!prev) return { rep, changed: false };
+  /* Снимается залипание только на ПОЛНОМ окне, а не на минимуме для вердикта.
+     Асимметрия намеренная: чтобы доказать минус, понадобилось 60 исходов, и
+     освобождать по 20 значит выпускать доказанно убыточный детектор в алерты на
+     втрое меньшем основании, чем его закрыли. Из двух ошибок здесь необратима
+     одна — алерт по убыточному сигналу стоит денег, а лишние полчаса тишины стоят
+     упущенной возможности, которую видно в журнале и можно вернуть. */
+  if (rep.n < EDGE_WINDOW) {
+    const since = new Date(prev.since).toISOString().slice(0, 10);
+    return {
+      rep: {
+        ...rep,
+        muted: true,
+        reason:
+          `выключен с ${since} по доказанному минусу (${prev.reason}). ` +
+          `Сейчас ${rep.n} исходов новой методики из ${EDGE_WINDOW}, нужных для пересмотра; текущая оценка — ${rep.reason}`,
+      },
+      changed: false,
+    };
+  }
+  // полное окно новых исходов и вердикт не отрицательный — реабилитация
+  delete mutes[kind];
+  return { rep, changed: true };
+}
+
 /* Отчёты пересчитываются не чаще раза в 30с: бутстрэп — 2000 ресэмплов на паттерн,
    а isPatternMuted вызывается на каждом сигнале в потоке алертов. Кэш инвалидируется
    и по времени, и по числу записей, чтобы свежая дооценка исходов не ждала минуту. */
@@ -1053,12 +1246,18 @@ export function patternEdges(): Record<PatternKind, EdgeReport> {
   }
   const seq = pnlSequences();
   const hits = hitSequences();
+  const mutes = loadMutes();
+  let dirty = false;
   const v = Object.fromEntries(
     ALL_KINDS.map((k) => {
       const base = RATE_BASELINE[k];
-      return [k, base != null ? computeRateEdge(hits[k].hit, base, hits[k].sym) : computeEdge(seq[k].pnl, seq[k].sym)];
+      const raw = base != null ? computeRateEdge(hits[k].hit, base, hits[k].sym) : computeEdge(seq[k].pnl, seq[k].sym);
+      const st = applySticky(k, raw, mutes);
+      if (st.changed) dirty = true;
+      return [k, st.rep];
     })
   ) as Record<PatternKind, EdgeReport>;
+  if (dirty) saveMutes(mutes);
   edgeCache = { ts: Date.now(), signals: nSig, outcomes: nOut, v };
   return v;
 }
@@ -1204,6 +1403,8 @@ export function patternStats(): { stats: PatternStat[]; anyWaiting: number } {
     let costN = 0;
     const byExit = { tp: 0, sl: 0, timeout: 0, converged: 0 };
     const bySrc = { series: 0, klines: 0, unknown: 0 };
+    const byTarget = { atr: 0, fixed: 0 };
+    const targets: number[] = [];
     /* Win-rate, разбитый по затвору алерта. Фильтр, поставленный перед выдачей,
        делает опубликованную цифру описанием ДРУГОЙ популяции, чем та, на которой
        он выбран, — и проверить его больше нечем, если отфильтрованное перестать
@@ -1239,6 +1440,10 @@ export function patternStats(): { stats: PatternStat[]; anyWaiting: number } {
         }
       }
       bySrc[oc.src ?? 'unknown']++;
+      if (oc.tpUsed != null) {
+        byTarget[oc.tpFromAtr ? 'atr' : 'fixed']++;
+        targets.push(oc.tpUsed);
+      }
       if (oc.exit) byExit[oc.exit]++;
       if (oc.pnlPct != null) {
         pnlSum += oc.pnlPct;
@@ -1288,6 +1493,10 @@ export function patternStats(): { stats: PatternStat[]; anyWaiting: number } {
       sumPnlPct: pnlN ? Math.round(pnlSum * 1000) / 1000 : null,
       byExit,
       bySrc,
+      byTarget,
+      medianTargetPct: targets.length
+        ? Math.round([...targets].sort((a, b) => a - b)[Math.floor(targets.length / 2)] * 1000) / 1000
+        : null,
       ...PATTERN_POPULATION[k],
       avgMaeWin: maeWinN ? Math.round((maeWinSum / maeWinN) * 100) / 100 : null,
       edge: edges[k],

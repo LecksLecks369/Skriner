@@ -26,6 +26,12 @@ interface PatternStat {
   avgCostPct: number | null;
   sumPnlPct: number | null;
   byExit: { tp: number; sl: number; timeout: number; converged: number };
+  /* Какой целью посчитаны исходы: atr — от волатильности монеты, fixed — запасная
+     фиксированная. Смесь обязана быть видна: это две разные величины под одним
+     win-rate, потому что у тихой монеты фиксированная цель берётся шумом, а у
+     громкой недостижима за окно. */
+  byTarget?: { atr: number; fixed: number };
+  medianTargetPct?: number | null;
   avgMaeWin: number | null;
   edge: EdgeReport;
   population: string;
@@ -289,6 +295,23 @@ export function PatternHistory() {
                       алерты этого типа выключены; сигналы продолжают писаться в историю — тип включится сам, когда убыточные исходы выйдут из окна
                     </div>
                   )}
+                </div>
+              )}
+              {/* Цель, на которой измерен win-rate выше. Без неё «45%» не
+                  интерпретируется: 45% на ходе 0.2% и 45% на ходе 1.5% — разные
+                  утверждения. И смесь двух целей в одной выборке видна цифрой. */}
+              {st.byTarget && st.byTarget.atr + st.byTarget.fixed > 0 && (
+                <div className="mt-1 text-[10px] leading-snug text-zinc-600">
+                  <span className="text-zinc-700">цель исхода: </span>
+                  {st.medianTargetPct != null ? `медиана ±${st.medianTargetPct.toFixed(2)}%` : '—'}
+                  {st.byTarget.fixed > 0 && st.byTarget.atr > 0 && (
+                    <span className="text-amber-500/80">
+                      {' '}
+                      · ⚠ смесь: {st.byTarget.atr} от волатильности монеты, {st.byTarget.fixed} по запасной фиксированной
+                    </span>
+                  )}
+                  {st.byTarget.fixed > 0 && st.byTarget.atr === 0 && ' · запасная фиксированная (волатильность неизвестна)'}
+                  {st.byTarget.atr > 0 && st.byTarget.fixed === 0 && ' · от волатильности каждой монеты'}
                 </div>
               )}
               <div className="mt-1.5 flex flex-wrap gap-x-2 text-[10px] text-zinc-500">

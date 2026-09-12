@@ -945,6 +945,8 @@ async function doScan(
         score: sc.score,
         wickAtr: sweepBest.wickAtr,
         volMult: sweepBest.volMult,
+        // без волатильности цель исхода выводится не из монеты, а из общей константы
+        natrPct: natrMax,
         netPct: netSpreadPct != null ? Number(netSpreadPct.toFixed(3)) : null,
       });
     }
@@ -953,6 +955,7 @@ async function doScan(
         ts: now,
         symbol: a.symbol,
         pattern: 'whale',
+        natrPct: natrMax,
         dir: wh.netUsd > 0 ? 'long' : 'short',
         price,
         ex: bestP[0],
@@ -967,6 +970,7 @@ async function doScan(
         ts: now,
         symbol: a.symbol,
         pattern: 'funding',
+        natrPct: natrMax,
         dir: signedFund > 0 ? 'short' : 'long', // против перегретой стороны
         price,
         ex: bestP[0],
@@ -1071,6 +1075,7 @@ async function doScan(
           ts: now,
           symbol: r.symbol,
           pattern: 'robot',
+          natrPct: r.natrPctMax,
           dir: r.deep.tape && r.deep.tape.aggression < 0 ? 'short' : 'long',
           price: r.price,
           ex: bestP[0],
@@ -1232,12 +1237,17 @@ async function doScan(
         ts: now,
         symbol: r.symbol,
         pattern: 'distribution',
+        natrPct: r.natrPctMax,
         dir: r.dist.dir,
         price: r.price,
         ex: bestP[0],
         native: bestP[1].native,
         score: r.score,
         setupScore: r.dist.score,
+        /* Доля прочитанных улик: скор нормирован по доступным слагаемым, поэтому
+           «70 по половине улик» и «70 по всем» — одно число и два разных сигнала.
+           Без этого поля их не расслоить в win-rate. */
+        coverage: r.dist.coverage,
         distKind: r.dist.kind,
         movePct: r.dist.movePct,
       });

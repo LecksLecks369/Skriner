@@ -128,11 +128,25 @@ export function detectBreakout(candles: Candle[], inp: BreakoutInput): BreakoutS
     if (Math.abs(cvd) >= 0.2) reasons.push('агрессия ' + (cvd > 0 ? 'покупателя' : 'продавца') + ' ' + cvd.toFixed(2));
   }
 
-  /* Ёрш штрафует готовность: в пиле граница диапазона протыкается по десять раз
-     на дню, и каждый такой «пробой» — ложный. */
+  /* Ёрш БОЛЬШЕ НЕ ШТРАФУЕТ готовность — остаётся пометкой.
+
+     Штраф стоял на утверждении «в пиле граница протыкается по десять раз, и каждый
+     такой пробой ложный». Скринер проверяет это утверждение сам, разбивая win-rate
+     пробоя по полосам ершистости на одной популяции (chopFilterReport). Замер на 541
+     исходе: 0–14 → 38% [32;45], 15–29 → 45% [39;52], 30–44 → 39% [29;51], 45+ → 64%
+     [35;85]. Интервалы перекрываются — эффекта не измерено ни в одну сторону, — но
+     точечная оценка идёт ПРОТИВ заявления: самая пилящая полоса лучшая, а не худшая.
+
+     Штраф при этом был затвором, а не украшением: он умножал готовность на 0.55–1.0
+     и мог увести её ниже порога записи 60, то есть подавленные сигналы не попадали
+     даже в журнал — и проверить, что именно он отсекал, было нечем. Величина,
+     поднятая из показателя в затвор, обязана пройти аудит до того, как начнёт решать;
+     здесь аудит был сделан после и заявление не подтвердил.
+
+     chopScore продолжает записываться на каждом сигнале пробоя, поэтому проверка
+     заявления идёт дальше и вернуть штраф можно будет по данным, а не по идее. */
   if (inp.chopScore >= 40) {
-    score *= 1 - 0.45 * clamp((inp.chopScore - 40) / 50);
-    reasons.push('⚠ ёрш ' + Math.round(inp.chopScore) + ' — пробой может быть ложным');
+    reasons.push('ёрш ' + Math.round(inp.chopScore) + ' — пила рядом (на готовность не влияет)');
   }
   if (distAtr > BREAKOUT_MAX_DIST_ATR && !fired) {
     reasons.push('до уровня ' + distAtr.toFixed(2) + ' ATR — дальше ' + BREAKOUT_MAX_DIST_ATR + ' ATR сигнал не выдаётся');
@@ -333,6 +347,11 @@ export interface DistInput {
 
 const MOVE_BARS = 15;
 
+/** Сумма весов всех слагаемых раздачи — знаменатель для доли покрытия */
+const DIST_MAX_POINTS = 100;
+/** Минимальная доля доступных улик, при которой вердикт вообще выносится */
+export const DIST_MIN_COVERAGE = 0.5;
+
 /**
  * Раздача/набор: монету двигают, но поток против движения.
  *
@@ -359,72 +378,133 @@ export function detectDistribution(candles: Candle[], inp: DistInput): Distribut
   const pump = movePct > 0;
 
   const reasons: string[] = [];
-  let score = 0;
+  /* Скор нормируется по ДОСТУПНЫМ слагаемым, а не по номинальным 100 баллам.
+
+     Слагаемых шесть, и каждое читает своё поле. Три из них — киты, позиция розницы,
+     ликвидации — приходят со стадий, которые скан роняет под бюджетом; замер: поля
+     ликвидаций и Л/Ш были пусты на всех 80 строках в 9 циклах из 12. Отсутствующее
+     слагаемое давало 0 баллов, то есть молча работало как голос ПРОТИВ раздачи, и
+     сумма упиралась в потолок доступного. Видно прямо в записи: 85 сигналов, шкала
+     0-100, порог 45 — а максимум за всю историю 60, выше 65 нет ни одного.
+
+     Правильная величина — доля набранного от того, что вообще можно было набрать.
+     Тогда «70 из 100» значит одно и то же при любом покрытии, а само покрытие едет
+     отдельным полем: решение, принятое по четверти улик, обязано быть отличимо от
+     решения по всем уликам, а не выглядеть как слабый сигнал. */
+  let got = 0;
+  let avail = 0;
+  const part = (max: number, have: boolean, earned: number, reason?: string) => {
+    if (!have) return; // нет данных — слагаемое не голосует ни за, ни против
+    avail += max;
+    got += earned;
+    if (reason) reasons.push(reason);
+  };
 
   // 1. OI против движения (25): рост на закрытии шортов / падение на закрытии лонгов
   const doi = inp.dOiPct15m;
-  if (doi != null && doi <= -0.25) {
-    score += 25 * clamp(Math.abs(doi) / 1.0);
-    reasons.push((pump ? 'рост' : 'падение') + ' на закрытии позиций (ΔOI ' + doi.toFixed(2) + '%)');
-  }
+  part(
+    25,
+    doi != null,
+    doi != null && doi <= -0.25 ? 25 * clamp(Math.abs(doi) / 1.0) : 0,
+    doi != null && doi <= -0.25
+      ? (pump ? 'рост' : 'падение') + ' на закрытии позиций (ΔOI ' + doi.toFixed(2) + '%)'
+      : undefined
+  );
 
   // 2. Тейкер-поток против движения (20)
   const flow = inp.tape?.aggression ?? inp.cvd;
-  if (flow != null && (pump ? flow < -0.05 : flow > 0.05)) {
-    score += 20 * clamp(Math.abs(flow) / 0.4);
-    reasons.push('поток против хода (' + (flow > 0 ? '+' : '') + flow.toFixed(2) + ')');
-  }
+  const flowOk = flow != null && (pump ? flow < -0.05 : flow > 0.05);
+  part(
+    20,
+    flow != null,
+    flowOk ? 20 * clamp(Math.abs(flow!) / 0.4) : 0,
+    flowOk ? 'поток против хода (' + (flow! > 0 ? '+' : '') + flow!.toFixed(2) + ')' : undefined
+  );
 
-  // 3. Крупный участник в противоход (20): киты по ленте Bybit + нетто сделок >$100k
+  // 3. Крупный участник в противоход (12 + 8)
   const whale = inp.whaleNetUsd;
-  if (whale != null && (pump ? whale <= -50_000 : whale >= 50_000)) {
-    score += 12 * clamp(Math.abs(whale) / 300_000);
-    reasons.push('киты ' + (whale > 0 ? 'покупают' : 'продают') + ' ' + Math.round(Math.abs(whale) / 1000) + 'K');
-  }
+  const whaleOk = whale != null && (pump ? whale <= -50_000 : whale >= 50_000);
+  part(
+    12,
+    whale != null,
+    whaleOk ? 12 * clamp(Math.abs(whale!) / 300_000) : 0,
+    whaleOk ? 'киты ' + (whale! > 0 ? 'покупают' : 'продают') + ' ' + Math.round(Math.abs(whale!) / 1000) + 'K' : undefined
+  );
   const big = inp.tape?.bigNetUsd;
-  if (big != null && (pump ? big <= -50_000 : big >= 50_000)) {
-    score += 8 * clamp(Math.abs(big) / 300_000);
-    reasons.push('крупные сделки в противоход ' + Math.round(Math.abs(big) / 1000) + 'K');
-  }
+  const bigOk = big != null && (pump ? big <= -50_000 : big >= 50_000);
+  part(
+    8,
+    big != null,
+    bigOk ? 8 * clamp(Math.abs(big!) / 300_000) : 0,
+    bigOk ? 'крупные сделки в противоход ' + Math.round(Math.abs(big!) / 1000) + 'K' : undefined
+  );
 
   // 4. Толпа набилась в сторону движения (15)
   const lsr = inp.lsrLongPct;
-  if (lsr != null && (pump ? lsr >= 60 : lsr <= 42)) {
-    score += 15 * clamp((pump ? lsr - 56 : 46 - lsr) / 18);
-    reasons.push('розница ' + (pump ? 'в лонгах' : 'в шортах') + ' ' + Math.round(lsr) + '%');
-  }
+  const lsrOk = lsr != null && (pump ? lsr >= 60 : lsr <= 42);
+  part(
+    15,
+    lsr != null,
+    lsrOk ? 15 * clamp((pump ? lsr! - 56 : 46 - lsr!) / 18) : 0,
+    lsrOk ? 'розница ' + (pump ? 'в лонгах' : 'в шортах') + ' ' + Math.round(lsr!) + '%' : undefined
+  );
 
   // 5. Фандинг перегрет в сторону движения (10)
   const f = inp.fundingSigned;
-  if (f != null && (pump ? f >= 0.0004 : f <= -0.0004)) {
-    score += 10 * clamp((Math.abs(f) - 0.0003) / 0.0008);
-    reasons.push('фандинг ' + (f * 100).toFixed(3) + '% — за движение платят');
-  }
+  const fOk = f != null && (pump ? f >= 0.0004 : f <= -0.0004);
+  part(
+    10,
+    f != null,
+    fOk ? 10 * clamp((Math.abs(f!) - 0.0003) / 0.0008) : 0,
+    fOk ? 'фандинг ' + (f! * 100).toFixed(3) + '% — за движение платят' : undefined
+  );
 
   // 6. Противоположную сторону уже вынесли (10): топливо израсходовано
   const fuel = pump ? inp.liqShortUsd : inp.liqLongUsd;
-  if (fuel != null && fuel >= 50_000) {
-    score += 10 * clamp(fuel / 500_000);
-    reasons.push((pump ? 'шорты' : 'лонги') + ' вынесены на ' + Math.round(fuel / 1000) + 'K');
-  }
+  const fuelOk = fuel != null && fuel >= 50_000;
+  part(
+    10,
+    fuel != null,
+    fuelOk ? 10 * clamp(fuel! / 500_000) : 0,
+    fuelOk ? (pump ? 'шорты' : 'лонги') + ' вынесены на ' + Math.round(fuel! / 1000) + 'K' : undefined
+  );
 
+  /* Доля улик, которые вообще удалось прочитать. Ниже этого порога вердикт не
+     выносится: «раздача по двум слагаемым из шести» и «раздача по шести» — разные
+     утверждения, и складывать их в один win-rate нельзя. Отказ от вердикта честнее
+     слабого вердикта, потому что слабый неотличим от сильного после округления. */
+  const coverage = Math.round((avail / DIST_MAX_POINTS) * 100) / 100;
+  const score = avail > 0 ? (got / avail) * 100 : 0;
   const final = Math.round(clamp(score, 0, 100));
-  const counter = final >= 45;
-  const kind = pump
-    ? counter
-      ? ('pump_distribution' as const)
-      : ('pump_trend' as const)
-    : counter
-      ? ('dump_absorption' as const)
-      : ('dump_trend' as const);
+  const counter = coverage >= DIST_MIN_COVERAGE && final >= 45;
+  /* Порядок проверок важен: сначала «хватило ли улик», потом «что они говорят».
+     Иначе строка с покрытием 38% получала kind 'pump_trend' — утверждение о рынке,
+     сделанное на трети улик, — рядом с причиной «вердикта нет». */
+  const kind =
+    coverage < DIST_MIN_COVERAGE
+      ? ('no_verdict' as const)
+      : pump
+        ? counter
+          ? ('pump_distribution' as const)
+          : ('pump_trend' as const)
+        : counter
+          ? ('dump_absorption' as const)
+          : ('dump_trend' as const);
   if (!counter) {
     reasons.length = 0;
-    reasons.push(pump ? 'рост подтверждён потоком и OI — тренд, не раздача' : 'падение подтверждено потоком и OI — тренд, не набор');
+    if (coverage < DIST_MIN_COVERAGE) {
+      /* Отличать «улик нет» от «улики против» обязательно: первое лечится данными,
+         второе — это вывод. Одинаковая формулировка отправляет читателя не туда. */
+      reasons.push('улик хватило только на ' + Math.round(coverage * 100) + '% веса — вердикта нет, не «тренд»');
+    } else {
+      reasons.push(pump ? 'рост подтверждён потоком и OI — тренд, не раздача' : 'падение подтверждено потоком и OI — тренд, не набор');
+    }
   }
   return {
     kind,
     dir: counter ? (pump ? 'short' : 'long') : null,
     score: final,
+    coverage,
     movePct: Math.round(movePct * 100) / 100,
     reasons,
   };

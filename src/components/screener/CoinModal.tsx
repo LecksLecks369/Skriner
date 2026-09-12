@@ -440,10 +440,15 @@ export function CoinModal({
                       ? 'Раздача в памп — сторона шорта'
                       : row.dist.kind === 'dump_absorption'
                         ? 'Набор в дамп — сторона лонга'
-                        : row.dist.kind === 'pump_trend'
-                          ? 'Рост подтверждён потоком'
-                          : 'Падение подтверждено потоком'}{' '}
+                        : row.dist.kind === 'no_verdict'
+                          ? 'Улик не хватило — вердикта нет'
+                          : row.dist.kind === 'pump_trend'
+                            ? 'Рост подтверждён потоком'
+                            : 'Падение подтверждено потоком'}{' '}
                     · {row.dist.score}
+                    {row.dist.coverage < 1 && (
+                      <span className="text-zinc-500"> · улик {Math.round(row.dist.coverage * 100)}%</span>
+                    )}
                   </span>
                   <div className="mt-1 text-[11px] text-zinc-500">
                     ход {row.dist.movePct > 0 ? '+' : ''}
