@@ -16,7 +16,16 @@ import fs from 'fs';
 import path from 'path';
 import type { CoinRow, ExchangeId, PaperTrade } from './types';
 import { netSpreadForPair } from './pair';
-import { arbConvergeLevelPct, arbCostPct, arbFeesPct, arbPnlPct, arbSlLevelPct, arbTpTargetPct } from './costs';
+import {
+  arbConvergeLevelPct,
+  arbFeesPct,
+  arbHoldCostPct,
+  arbPnlPct,
+  arbSlLevelPct,
+  arbTotalCostPct,
+  arbTpTargetPct,
+  fundingHourlyPctOf,
+} from './costs';
 
 const DATA_DIR = path.join(process.cwd(), 'data');
 const FILE = path.join(DATA_DIR, 'paper_trades.json');
@@ -49,16 +58,40 @@ const DEFAULT_SIZE_USD = 25_000;
     + проскальзывание входа и выхода), а «тейк» ставится по прибыли, а не по схлопыванию
     спреда. Сделки v1 при загрузке пересчитываются: у них комиссии не вычитались ни разу,
     и всякое схлопывание помечалось как 'tp' независимо от знака результата. */
-export const PNL_MODEL_VERSION = 2;
+/* v3: к издержкам круга добавлена стоимость удержания — нетто-фандинг обеих ног
+   за фактическое время в позиции. При среднем удержании 3.4 часа это слагаемое
+   крупнее комиссий, а модель его не знала вовсе. У сделок, открытых до v3, ставок
+   не записано: их fundingCostPct = 0, и это видно по fundingModeled. */
+export const PNL_MODEL_VERSION = 3;
 
-/** Полные издержки круга сделки, % от номинала */
-export function tradeCostPct(t: Pick<PaperTrade, 'buyEx' | 'sellEx' | 'slipRoundTripPct'>): number {
-  return arbCostPct(t.buyEx, t.sellEx, t.slipRoundTripPct ?? null);
+/**
+ * Стоимость удержания на момент atTs, % от номинала.
+ *
+ * ДОПУЩЕНИЕ, а не замер: ставка снята один раз, на входе, и считается постоянной
+ * всё время удержания, а начисление — непрерывным, хотя биржа списывает его
+ * дискретно в моменты расчёта. Поэтому слагаемое хранится отдельным полем и не
+ * растворяется в costPct без следа: читатель должен видеть, какую его часть
+ * можно оспорить.
+ */
+export function fundingCostPct(t: Pick<PaperTrade, 'ts' | 'fundingHourlyPct'>, atTs = Date.now()): number {
+  return arbHoldCostPct(t.fundingHourlyPct, atTs - t.ts);
+}
+
+/** Полные издержки круга на момент atTs: комиссии + слипейдж входа и выхода + фандинг удержания */
+export function tradeCostPct(
+  t: Pick<PaperTrade, 'buyEx' | 'sellEx' | 'slipRoundTripPct' | 'ts' | 'fundingHourlyPct'>,
+  atTs = Date.now()
+): number {
+  return arbTotalCostPct(t.buyEx, t.sellEx, t.slipRoundTripPct ?? null, t.fundingHourlyPct, atTs - t.ts);
 }
 
 /** P&L, если закрыться прямо сейчас по нетто-спреду cur */
-export function pnlIfClosed(t: Pick<PaperTrade, 'buyEx' | 'sellEx' | 'slipRoundTripPct' | 'netEntry'>, cur: number): number {
-  return arbPnlPct(t.netEntry, cur, tradeCostPct(t));
+export function pnlIfClosed(
+  t: Pick<PaperTrade, 'buyEx' | 'sellEx' | 'slipRoundTripPct' | 'netEntry' | 'ts' | 'fundingHourlyPct'>,
+  cur: number,
+  atTs = Date.now()
+): number {
+  return arbPnlPct(t.netEntry, cur, tradeCostPct(t, atTs));
 }
 
 /* ---------------- Хранилище ---------------- */
@@ -108,10 +141,15 @@ function migrateClosed(trades: PaperTrade[]): boolean {
 
 /** Записать в сделку издержки и P&L выхода по нетто-спреду netExit */
 function applyPnl(tr: PaperTrade, netExit: number) {
-  const cost = tradeCostPct(tr);
+  /* Издержки считаются на момент ЗАКРЫТИЯ: фандинг накапливается, пока позиция
+     открыта, поэтому Date.now() здесь дал бы растущую стоимость уже закрытой
+     сделки при каждом пересчёте модели. */
+  const atTs = tr.closedTs ?? Date.now();
+  const cost = tradeCostPct(tr, atTs);
   const gross = tr.netEntry - netExit;
   tr.netExit = netExit;
   tr.feesPct = Number(arbFeesPct(tr.buyEx, tr.sellEx).toFixed(4));
+  tr.fundingCostPct = Number(fundingCostPct(tr, atTs).toFixed(4));
   tr.costPct = Number(cost.toFixed(4));
   tr.pnlGrossPct = Number(gross.toFixed(4));
   tr.pnlPct = Number((gross - cost).toFixed(4));
@@ -142,6 +180,7 @@ export interface OpenInput {
   score?: number;
   sizeUsd?: number;
   slipRoundTripPct?: number | null;
+  fundingHourlyPct?: number | null;
   auto?: boolean;
 }
 
@@ -150,6 +189,10 @@ export function openPaperTrade(input: OpenInput): PaperTrade {
   const slipRt =
     typeof input.slipRoundTripPct === 'number' && Number.isFinite(input.slipRoundTripPct) && input.slipRoundTripPct >= 0
       ? Number(input.slipRoundTripPct.toFixed(4))
+      : null;
+  const fundRt =
+    typeof input.fundingHourlyPct === 'number' && Number.isFinite(input.fundingHourlyPct)
+      ? Number(input.fundingHourlyPct.toFixed(4))
       : null;
   const trade: PaperTrade = {
     id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
@@ -165,6 +208,8 @@ export function openPaperTrade(input: OpenInput): PaperTrade {
     sizeUsd: typeof input.sizeUsd === 'number' && Number.isFinite(input.sizeUsd) ? input.sizeUsd : undefined,
     slipRoundTripPct: slipRt ?? undefined,
     slipModeled: slipRt != null,
+    fundingHourlyPct: fundRt ?? undefined,
+    fundingModeled: fundRt != null,
     auto: input.auto || undefined,
   };
   trades.push(trade);
@@ -260,16 +305,20 @@ export function autoPaper(rows: CoinRow[]): AutoPaperResult {
     .slice(0, MAX_OPEN - openNow.length);
 
   for (const r of candidates) {
+    const buyEx = r.bestAsk!.exchange;
+    const sellEx = r.bestBid!.exchange;
+    const exRow = (id: ExchangeId) => r.exchanges.find((e) => e.exchange === id) ?? null;
     openPaperTrade({
       symbol: r.symbol,
-      buyEx: r.bestAsk!.exchange,
-      sellEx: r.bestBid!.exchange,
+      buyEx,
+      sellEx,
       pBuy: r.bestAsk!.price,
       pSell: r.bestBid!.price,
       netEntry: r.netSpreadPct!,
       score: r.score,
       sizeUsd: r.deep?.slipBudgetUsd ?? DEFAULT_SIZE_USD,
       slipRoundTripPct: r.deep?.slipRoundTripPct ?? null,
+      fundingHourlyPct: fundingHourlyPctOf(exRow(buyEx), exRow(sellEx)),
       auto: true,
     });
     res.opened++;

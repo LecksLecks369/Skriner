@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { patternStats, recentPatterns, resolvePending } from '@/lib/screener/patterns';
+import { chopFilterReport, patternStats, recentPatterns, resolvePending } from '@/lib/screener/patterns';
 
 export const dynamic = 'force-dynamic';
 
@@ -16,6 +16,8 @@ export async function GET() {
       stats,
       anyWaiting,
       signals: recentPatterns(120),
+      /* Проверка ерша по его собственному заявлению, а не по удержанию пилы */
+      chopFilter: chopFilterReport(),
     });
   } catch (e) {
     // история паттернов читается из jsonl/json на диске

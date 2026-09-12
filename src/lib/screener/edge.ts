@@ -27,6 +27,10 @@ export type EdgeVerdict = 'insufficient' | 'negative' | 'inconclusive' | 'positi
 export interface EdgeReport {
   n: number; // сколько исходов вошло в оценку (окно)
   nTotal: number; // сколько разрешённых исходов есть всего
+  /* Сколько среди них НЕЗАВИСИМЫХ единиц (разных символов): n считает строки,
+     а строки одного символа — повторные замеры одного события. Пусто там, где
+     единицы не переданы. */
+  nUnits: number | null;
   expectancyPct: number | null; // среднее чистое P&L на сделку, %
   ciLoPct: number | null; // 95% доверительный интервал матожидания
   ciHiPct: number | null;
@@ -67,16 +71,58 @@ function mean(xs: number[]): number {
   return xs.reduce((s, x) => s + x, 0) / xs.length;
 }
 
-/** Перцентильный бутстрэп-интервал среднего */
-export function bootstrapMeanCI(xs: number[], level = 0.95): { lo: number; hi: number } | null {
+/**
+ * Перцентильный бутстрэп-интервал среднего.
+ *
+ * groups — метка независимой единицы для каждого наблюдения (у нас символ). Если
+ * она задана, ресэмплятся ЕДИНИЦЫ ЦЕЛИКОМ, а не строки: строки одного символа
+ * коррелированы, и ресэмплинг по строкам считает каждую за независимое
+ * наблюдение. Замер по истории спреда: 133 исхода пришли с 36 символов, 38% из
+ * них стартовали внутри окна предыдущего сигнала того же символа, а один символ
+ * дал 70% всего P&L. Интервал по строкам выходил уже истинного ровно в меру
+ * дублирования — и вердикт, открывающий алерты, стоял на нём.
+ */
+export function bootstrapMeanCI(xs: number[], level = 0.95, groups?: string[]): { lo: number; hi: number } | null {
   const n = xs.length;
   if (n < 2) return null;
   const rand = rng(seedOf(xs));
   const means = new Array<number>(BOOTSTRAP_B);
-  for (let b = 0; b < BOOTSTRAP_B; b++) {
-    let s = 0;
-    for (let i = 0; i < n; i++) s += xs[(rand() * n) | 0];
-    means[b] = s / n;
+
+  /* Кластерный бутстрэп: единица ресэмплинга — символ. Единиц меньше двух —
+     интервал по ним не построить, честнее вернуть построчный, чем не вернуть
+     ничего: он оптимистичен, но это единственное, что данные позволяют. */
+  const clusters: number[][] = [];
+  if (groups && groups.length === n) {
+    const by = new Map<string, number[]>();
+    for (let i = 0; i < n; i++) {
+      const g = groups[i];
+      const cur = by.get(g);
+      if (cur) cur.push(xs[i]);
+      else by.set(g, [xs[i]]);
+    }
+    if (by.size >= 2) clusters.push(...by.values());
+  }
+
+  if (clusters.length >= 2) {
+    const K = clusters.length;
+    for (let b = 0; b < BOOTSTRAP_B; b++) {
+      let s = 0;
+      let cnt = 0;
+      for (let i = 0; i < K; i++) {
+        const c = clusters[(rand() * K) | 0];
+        for (const v of c) {
+          s += v;
+          cnt++;
+        }
+      }
+      means[b] = cnt ? s / cnt : 0;
+    }
+  } else {
+    for (let b = 0; b < BOOTSTRAP_B; b++) {
+      let s = 0;
+      for (let i = 0; i < n; i++) s += xs[(rand() * n) | 0];
+      means[b] = s / n;
+    }
   }
   means.sort((a, b) => a - b);
   const alpha = (1 - level) / 2;
@@ -136,6 +182,7 @@ export function computeRateEdge(hits: boolean[], baseRate: number): EdgeReport {
   const out: EdgeReport = {
     n,
     nTotal,
+    nUnits: null, // попадание/промах: единица наблюдения сюда не передаётся
     expectancyPct: null, // не определено: сделки нет
     ciLoPct: null,
     ciHiPct: null,
@@ -175,13 +222,16 @@ export function computeRateEdge(hits: boolean[], baseRate: number): EdgeReport {
   return out;
 }
 
-export function computeEdge(pnls: number[]): EdgeReport {
+export function computeEdge(pnls: number[], groups?: string[]): EdgeReport {
   const nTotal = pnls.length;
   const win = pnls.slice(-EDGE_WINDOW);
   const n = win.length;
+  const winGroups = groups && groups.length === nTotal ? groups.slice(-EDGE_WINDOW) : undefined;
+  const nUnits = winGroups ? new Set(winGroups).size : null;
   const base: EdgeReport = {
     n,
     nTotal,
+    nUnits,
     expectancyPct: null,
     ciLoPct: null,
     ciHiPct: null,
@@ -202,7 +252,7 @@ export function computeEdge(pnls: number[]): EdgeReport {
   const grossWin = wins.reduce((s, p) => s + p, 0);
   const grossLoss = losses.reduce((s, p) => s + Math.abs(p), 0);
   const exp = mean(win);
-  const ci = bootstrapMeanCI(win);
+  const ci = bootstrapMeanCI(win, 0.95, winGroups);
   const wr = wilsonInterval(wins.length, n);
 
   const out: EdgeReport = {
@@ -217,6 +267,11 @@ export function computeEdge(pnls: number[]): EdgeReport {
     sumPnlPct: r3(win.reduce((s, p) => s + p, 0)),
   };
 
+  /* n — число строк, nUnits — число независимых символов за ними. Когда второе
+     заметно меньше первого, интервал построен по кластерам, и читатель должен
+     видеть, на скольких единицах он на самом деле стоит. */
+  const units = nUnits != null && nUnits < n ? `, независимых символов ${nUnits}` : '';
+
   if (n < EDGE_MIN_N) {
     out.verdict = 'insufficient';
     out.reason = `нужно ${EDGE_MIN_N} исходов, есть ${n}`;
@@ -225,15 +280,17 @@ export function computeEdge(pnls: number[]): EdgeReport {
   if (ci && ci.hi < 0) {
     out.verdict = 'negative';
     out.muted = true;
-    out.reason = `весь интервал ниже нуля (до ${r3(ci.hi)}% на сделку, n=${n}) — паттерн не окупает издержки`;
+    out.reason = `весь интервал ниже нуля (до ${r3(ci.hi)}% на сделку, n=${n}${units}) — паттерн не окупает издержки`;
     return out;
   }
   if (ci && ci.lo > 0) {
     out.verdict = 'positive';
-    out.reason = `интервал целиком выше нуля (от ${r3(ci.lo)}% на сделку, n=${n})`;
+    out.reason = `интервал целиком выше нуля (от ${r3(ci.lo)}% на сделку, n=${n}${units})`;
     return out;
   }
   out.verdict = 'inconclusive';
-  out.reason = ci ? `ноль внутри интервала [${r3(ci.lo)}%; ${r3(ci.hi)}%] при n=${n} — эдж не доказан` : `n=${n}`;
+  out.reason = ci
+    ? `ноль внутри интервала [${r3(ci.lo)}%; ${r3(ci.hi)}%] при n=${n}${units} — эдж не доказан`
+    : `n=${n}`;
   return out;
 }

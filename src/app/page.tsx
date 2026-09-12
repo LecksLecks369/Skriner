@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { CoinRow } from '@/lib/screener/types';
+import { EXCHANGES, type CoinRow } from '@/lib/screener/types';
 import { useScreener } from '@/components/screener/useScreener';
 import { Header } from '@/components/screener/Header';
 import { Filters } from '@/components/screener/Filters';
@@ -148,7 +148,7 @@ export default function Home() {
             сигналов ≥ {threshold}%: <b className="tabular-nums">{stats.alerting}</b>
           </span>
           <span className="rounded-md border border-zinc-800 bg-zinc-900/60 px-2 py-1 text-zinc-400">
-            бирж активно: <b className="tabular-nums">{stats.live}/6</b>
+            бирж активно: <b className="tabular-nums">{stats.live}/{EXCHANGES.length}</b>
           </span>
           <span className="hidden text-zinc-600 sm:inline">
             скан-цикл 45с · горячие клавиши: / поиск · j/k навигация · r радар · l неликвид
@@ -210,7 +210,7 @@ export default function Home() {
       </main>
 
       <footer className="mt-auto border-t border-zinc-800 px-3 py-3 text-[10px] leading-relaxed text-zinc-600 sm:px-5">
-        MetaScreener × 6 premium — публичные API Bybit · BingX · OKX · Bitget · MEXC · Ourbit; страх/жадность alternative.me;
+        MetaScreener × 7 premium — публичные API Bybit · Binance · BingX · OKX · Bitget · MEXC · Ourbit; страх/жадность alternative.me;
         глобальные метрики CoinGecko. Не является инвестиционной рекомендацией. Нетто-спред учитывает taker-комиссии,
         но не вывод и проскальзывание. Настройки, watchlist, пресеты и ключи оповещений — в localStorage; журнал,
         снапшоты и paper-сделки — на сервере.

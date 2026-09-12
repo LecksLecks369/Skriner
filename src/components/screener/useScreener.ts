@@ -145,10 +145,18 @@ export function useScreener() {
   const [loading, setLoading] = useState(true);
   const [lastUpdate, setLastUpdate] = useState<number>(0);
   const [paused, setPaused] = useState(false);
+  /* Рефы обновляются в эффекте, а не в рендере. Рендер в React 18 может быть
+     отброшен (StrictMode, конкурентный режим) — запись в реф из отброшенного
+     рендера остаётся, и опрос начинает ходить с настройками, которых на экране
+     никогда не было. Эффект выполняется только у рендера, который закоммичен. */
   const settingsRef = useRef(settings);
-  settingsRef.current = settings;
   const filtersRef = useRef(filters);
-  filtersRef.current = filters;
+  useEffect(() => {
+    settingsRef.current = settings;
+  }, [settings]);
+  useEffect(() => {
+    filtersRef.current = filters;
+  }, [filters]);
 
   const setFilters = useCallback((f: Partial<Filters>) => {
     setFiltersState((prev) => {

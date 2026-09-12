@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import type { CoinRow, PaperTrade } from '@/lib/screener/types';
 import type { NetworkInfo } from '@/lib/screener/networks';
 import { netSpreadForPair } from '@/lib/screener/pair';
+import { fundingHourlyPctOf } from '@/lib/screener/costs';
 import { BREAKOUT_MAX_DIST_ATR } from '@/lib/screener/setups';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
@@ -184,6 +185,11 @@ function PaperSection({ row }: { row: CoinRow }) {
           // глубина стакана на момент входа: без неё P&L симулятора завышен
           slipRoundTripPct: row.deep?.slipRoundTripPct ?? undefined,
           sizeUsd: row.deep?.maxPosUsd ?? undefined,
+          // ставки фандинга обеих ног: позиция нейтральна по цене, но не по карри
+          fundingHourlyPct: fundingHourlyPctOf(
+            row.exchanges.find((e) => e.exchange === row.bestAsk!.exchange) ?? null,
+            row.exchanges.find((e) => e.exchange === row.bestBid!.exchange) ?? null
+          ),
         }),
       });
       load();
@@ -313,6 +319,39 @@ export function CoinModal({
         </DialogHeader>
 
         <AiComment symbol={row.symbol} />
+
+        {/* Исполнимость по размеру: один размер отвечает не на тот вопрос.
+            На $25k круг съедает разрыв почти всегда, и «эджа нет» оказывается
+            утверждением про выбранный объём, а не про сигнал. */}
+        {row.deep?.arbSizeLadder && row.deep.arbSizeLadder.length > 0 && (
+          <section className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-3">
+            <div className="mb-2 text-xs text-zinc-500">
+              Исполнимый спред по размеру позиции — разрыв минус слипейдж круга (вход и выход)
+            </div>
+            <div className="grid grid-cols-4 gap-2 text-center font-mono text-xs">
+              {row.deep.arbSizeLadder.map((s) => (
+                <div
+                  key={s.usd}
+                  className={`rounded border px-1 py-1.5 ${
+                    s.netExecPct > 0 ? 'border-emerald-600/40 bg-emerald-950/30' : 'border-zinc-800 bg-zinc-900/40'
+                  }`}
+                  title={`слипейдж круга ${s.slipRoundTripPct.toFixed(3)}%`}
+                >
+                  <div className="text-[10px] text-zinc-500">${s.usd >= 1000 ? `${s.usd / 1000}k` : s.usd}</div>
+                  <div className={s.netExecPct > 0 ? 'text-emerald-400' : 'text-rose-400'}>
+                    {s.netExecPct > 0 ? '+' : ''}
+                    {s.netExecPct.toFixed(2)}%
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="mt-2 text-[11px] text-zinc-500">
+              {row.deep.arbMaxSizeUsd != null
+                ? `Окупается до $${row.deep.arbMaxSizeUsd.toLocaleString('ru-RU')}. Комиссии учтены, фандинг удержания — нет.`
+                : 'Не окупается ни на одном размере лестницы, включая $1k.'}
+            </div>
+          </section>
+        )}
 
         {/* чарт спреда */}
         <section>

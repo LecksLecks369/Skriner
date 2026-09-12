@@ -37,7 +37,14 @@ export function filterAndSort(
     if (q && !r.symbol.includes(q)) return false;
     if (r.turnoverUsd < filters.minTurnoverM * 1e6) return false;
     if ((r.crossSpreadPct ?? 0) < filters.minSpread) return false;
-    if ((r.netSpreadPct ?? -Infinity) < filters.minNet) return false;
+    /* Ноль = фильтр выключен, как у всех остальных числовых полей панели. Раньше ноль
+       здесь был активным условием «нетто ≥ 0», и это прятало почти весь рынок: нетто —
+       это разрыв минус тейкерские комиссии обеих сторон, у BTC кросс-спред 0.009% против
+       комиссий 0.105%, то есть нетто −0.096%. Из 80 строк проходило 7, и выглядело это
+       как «скринер не показывает монеты», а не как работа фильтра. Неизвестный нетто
+       по-прежнему не проходит ЗАПРОШЕННЫЙ порог: утверждать, что строка ему удовлетворяет,
+       нельзя — но при выключенном фильтре она и не должна скрываться. */
+    if (filters.minNet > 0 && (r.netSpreadPct ?? -Infinity) < filters.minNet) return false;
     if (r.score < filters.minScore) return false;
     if (r.coverage < filters.minCoverage) return false;
     if (filters.minZ > 0 && (r.zScore ?? 0) < filters.minZ) return false;

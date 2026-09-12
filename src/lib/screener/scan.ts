@@ -373,6 +373,33 @@ async function doScan(
 ): Promise<ScanResponse> {
   warmupSeries(); // прогрев: восстановить серии с диска до первых записей
   const now = Date.now();
+
+  /* Бюджет скана по настенным часам. Без него скан идёт столько, сколько нужно всем
+     стадиям, и при деградации сети это минуты: замер 2026-09-11 — 127 с при живой
+     сети и >280 с при медленной, когда недоступны даже Google Fonts. Клиент за это
+     время не получает НИЧЕГО — таблица пуста, хотя цены и спреды были готовы на
+     первой стадии. Поэтому обогащение (OI, спот-базис, стакан с лентой, ликвидации)
+     за пределами бюджета пропускается, а строки отдаются.
+
+     Пропуск обязан быть виден: молчаливо усечённый ответ неотличим от сломанной
+     биржи, поэтому список пропущенных стадий уезжает в ответе. */
+  const SCAN_BUDGET_MS = 45_000;
+  /* Стадии срезаются в порядке стоимости, а дороже всех — стакан. Но стакан
+     единственный, кто считает слипейдж: без него netExecPct = null, бумажный
+     симулятор не открывает сделок, а алерт всё равно уходит по сырому спреду,
+     из которого издержки исполнения не вычтены. Замер: 24 живых скана подряд,
+     стадия стакана пропущена во всех 24. Деградация имела направление —
+     система теряла ровно то слагаемое, которое может отменить вердикт, и
+     сходилась к своему самому выгодному ответу.
+
+     Поэтому у стакана есть резерв: необязательное обогащение (свечи, OI,
+     спот-базис, киты, ликвидации) уступает место раньше и меряется по
+     budgetLeft(), а стадия стакана — по deepBudgetLeft() до полного дедлайна. */
+  const DEEP_RESERVE_MS = 15_000;
+  const deadline = now + SCAN_BUDGET_MS;
+  const budgetLeft = () => deadline - DEEP_RESERVE_MS - Date.now();
+  const deepBudgetLeft = () => deadline - Date.now();
+  const skippedStages = new Set<string>();
   const [tickers, fundingIntervals] = await Promise.all([getTickers(), getFundingIntervals()]);
   const okExchanges = EXCHANGES.filter((e) => tickers[e.id]?.ok);
 
@@ -460,6 +487,13 @@ async function doScan(
   await pMap(
     ranked,
     async ({ a }) => {
+      /* Свечи нужны для волатильности, скора и сетапов, но при исчерпанном бюджете
+         строка без них полезнее отсутствия строки: цена, котировки и спред уже есть
+         из тикеров. Монеты идут по убыванию оборота, поэтому обрезается хвост. */
+      if (budgetLeft() <= 0) {
+        skippedStages.add('свечи');
+        return;
+      }
       const kl = new Map<ExchangeId, KlinesResult>();
       const ex = new Map<ExchangeId, Extra>();
       await Promise.all(
@@ -486,6 +520,10 @@ async function doScan(
   const top40 = ranked.slice(0, 40);
   await Promise.all([
     ...top40.map(async ({ a }) => {
+      if (budgetLeft() <= 0) {
+        skippedStages.add('OI бирж');
+        return;
+      }
       const okxP = a.per.get('okx');
       if (okxP) {
         const [funding, oi] = await Promise.all([
@@ -536,6 +574,10 @@ async function doScan(
   await pMap(
     ranked.slice(0, 30),
     async ({ a }) => {
+      if (budgetLeft() <= 0) {
+        skippedStages.add('спот-базис и киты');
+        return;
+      }
       const p = a.per.get('bybit');
       if (!p) return;
       whaleMap.set(a.symbol, await getWhale(p.native));
@@ -596,16 +638,24 @@ async function doScan(
     // серии в стор
     for (const [exId, p] of a.per) {
       seriesStore.addPrice(a.symbol, exId, now, p.price);
+      /* Котировки по биржам: путь разрыва для оценки исхода обязан считаться по
+         той же паре и тем же выражением, что и вход. */
+      if (p.bid != null && p.ask != null && p.bid > 0 && p.ask > 0) {
+        seriesStore.addQuote(a.symbol, exId, now, p.bid, p.ask);
+      }
       if (p.oi != null) seriesStore.addOi(a.symbol, exId, now, p.oi);
       if (p.funding != null) seriesStore.addFunding(a.symbol, exId, now, p.funding);
       const ext = extras.get(a.symbol)?.get(exId);
       if (ext?.oi != null) seriesStore.addOi(a.symbol, exId, now, ext.oi);
       if (ext?.funding != null) seriesStore.addFunding(a.symbol, exId, now, ext.funding);
     }
-    if (crossSpreadPct != null) seriesStore.addCrossSpread(a.symbol, now, crossSpreadPct);
-
-    // z-score и возраст сигнала
+    /* z-score СНАЧАЛА, запись в серию — после. Порядок был обратный, и текущее
+       значение попадало в собственную историю: оно тянуло среднее к себе и
+       раздувало дисперсию, то есть занижало z ровно на всплеске — там, где по
+       нему теперь принимается решение об алерте. Контроль не может включать в
+       себя измеряемую единицу. */
     const zScore = crossSpreadPct != null ? seriesStore.spreadZScore(a.symbol, crossSpreadPct) : null;
+    if (crossSpreadPct != null) seriesStore.addCrossSpread(a.symbol, now, crossSpreadPct);
 
     // метрики per exchange
     const exRows: ExchangeRow[] = [];
@@ -938,6 +988,10 @@ async function doScan(
   await pMap(
     deepTargets,
     async (r) => {
+      if (deepBudgetLeft() <= 0) {
+        skippedStages.add('стакан и лента');
+        return;
+      }
       const a = aggBySym.get(r.symbol);
       if (!a) return;
       const entryExId = r.bestAsk && a.per.has(r.bestAsk.exchange) ? r.bestAsk.exchange : null;
@@ -1042,6 +1096,10 @@ async function doScan(
   await pMap(
     liqTargets,
     async (r) => {
+      if (budgetLeft() <= 0) {
+        skippedStages.add('ликвидации и Л/Ш');
+        return;
+      }
       const a = aggBySym.get(r.symbol);
       if (!a) return;
       const okxP = a.per.get('okx');
@@ -1225,6 +1283,7 @@ async function doScan(
     // скачок этого числа = биржа изменила состав инструментов
     excludedByClass,
     excludedAsNonPerp,
+    skippedStages: [...skippedStages],
     statuses,
     errors,
     refExchange: refExchangePref === 'auto' ? 'auto' : refExchangePref,

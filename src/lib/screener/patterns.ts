@@ -14,15 +14,21 @@
    (спред входа − спред выхода − комиссии обеих ног дважды). «Разрыв сошёлся вдвое» само по себе
    не значит прибыли — круг регулярно стоит дороже разрыва; такой выход помечается 'converged'.
 
-   Оценка исходов: сначала серии в памяти (до ~9ч), затем 1м-клайны биржи сигнала (до ~85м назад);
-   если и там пусто — сигнал ждёт; старше 6 часов — помечается истёкшим (в win-rate не идёт). */
+   Оценка исходов: для направленных паттернов и спреда — сначала серии в памяти (до ~9ч),
+   затем 1м-клайны биржи сигнала. Для «ерша» порядок обратный, клайны первыми: его исход
+   определён на поминутных закрытиях, а серия пишется с шагом скана и
+   систематически занижает пройденный путь. Если оценить нечем — сигнал ждёт, но только пока его окно
+   исхода внутри покрытия клайнов (KLINES_COVER_MS); старше 6 часов — помечается истёкшим
+   (в win-rate не идёт). Очередь дооценки идёт не по возрасту, а по остатку
+   оцениваемости — иначе просроченный префикс съедает батч и свежие сигналы протухают
+   не дождавшись. */
 
 import fs from 'fs';
 import path from 'path';
 import type { Candle, ExchangeId } from './types';
-import { fetchKlines } from './exchanges';
+import { fetchKlines, KLINES_BARS } from './exchanges';
 import { seriesStore } from './store';
-import { BREAKOUT_ALERT, CHOP_BASE_RATE, CHOP_ER_MAX, CHOP_SCORE_MIN } from './setups';
+import { BREAKOUT_ALERT, CHOP_ER_MAX, CHOP_PERSIST_BASE_RATE } from './setups';
 import {
   arbConvergeLevelPct,
   arbFeesPct,
@@ -31,7 +37,7 @@ import {
   directionalCostPct,
   feePairPct,
 } from './costs';
-import { computeEdge, computeRateEdge, type EdgeReport } from './edge';
+import { computeEdge, computeRateEdge, wilsonInterval, type EdgeReport } from './edge';
 
 export type PatternKind = 'spread' | 'robot' | 'sweep' | 'whale' | 'funding' | 'breakout' | 'distribution' | 'chop';
 
@@ -81,7 +87,38 @@ export interface PatternSignal {
     v3: из результата вычитаются издержки круга — комиссии тейкером на входе и выходе;
         для спреда впервые считается сам результат сделки, а не факт схлопывания разрыва
         (схлопывание вдвое ничего не говорит о прибыли: круг может стоить дороже разрыва). */
-export const OUTCOME_VERSION = 3;
+/* v4: путь разрыва считается по КОТИРОВКАМ ТОЙ ЖЕ ПАРЫ, что и вход, и со знаком.
+      До v4 ветка серий брала разрыв лучшей пары монеты на каждом тике (пара
+      плавала — на LSKUSDT четыре контрагента за 38 минут), а ветка свечей брала
+      модуль разности закрытий к середине — три разных выражения под одним именем,
+      и winrate расходился 91% против 54.5% в зависимости от того, какая ветка
+      сработала. Исходы v≤3 несравнимы с новыми и отбрасываются загрузчиком. */
+export const OUTCOME_VERSION = 4;
+
+/**
+ * Минимальная версия, при которой исход сравним с новыми, ПО ТИПАМ.
+ *
+ * Версия исхода — свойство ВЫРАЖЕНИЯ, а не системы целиком. В v4 сменился путь
+ * только у спреда; направленные паттерны считаются ровно как раньше. Глобальная
+ * проверка `v < OUTCOME_VERSION` выбросила бы вместе со спредом историю семи
+ * детекторов, которых правка не касалась, — и заодно те самые исходы, по которым
+ * робот, фандинг и пробой были ВЫКЛЮЧЕНЫ как убыточные. Замер: бамп обнулил 1054
+ * разрешённых исхода, вердикты всех типов стали 'insufficient', и три доказанно
+ * отрицательных паттерна снова начали слать алерты.
+ *
+ * Поэтому порог задаётся per-pattern и поднимается только у того типа, чьё
+ * выражение действительно изменилось.
+ */
+const OUTCOME_MIN_V: Partial<Record<PatternKind, number>> = {
+  spread: 4, // путь разрыва: своя пара бирж вместо лучшей, со знаком
+};
+const OUTCOME_MIN_V_DEFAULT = 3;
+
+/** Тип паттерна из ключа исхода (`<pattern>:<symbol>:<ts>`) */
+function kindFromKey(key: string): PatternKind | null {
+  const k = key.slice(0, key.indexOf(':'));
+  return (ALL_KINDS as readonly string[]).includes(k) ? (k as PatternKind) : null;
+}
 
 /** 'converged' — разрыв сошёлся, но прибыли после издержек нет; тейком это не считается */
 export type ExitReason = 'tp' | 'sl' | 'timeout' | 'converged';
@@ -121,6 +158,12 @@ const HORIZON_MS = 30 * 60 * 1000;
 const EXPIRE_MS = 6 * 3600 * 1000;
 const RESOLVE_BATCH = 10; // максимум дооценок за вызов (лимит API-нагрузки)
 
+/* Насколько назад видит оценка исхода. Выводится из глубины клайнов, а не задаётся
+   своим числом: это одна и та же величина, и разъехаться они не должны. Сигнал
+   старше этого окна дооценить нечем — резолвер по этому и решает, кого ставить
+   в очередь первым. */
+const KLINES_COVER_MS = KLINES_BARS * 60_000;
+
 /* Пороги ЗАПИСИ в журнал. Живут здесь, рядом с WIN_THR, а не в scan.ts, потому что
    порог записи — это граница популяции, по которой считается win-rate, а не деталь
    скана. Подпись под цифрой в «Истории» выводится из этих же констант: подпись,
@@ -139,6 +182,63 @@ export const RECORD_THR = {
 } as const;
 
 /**
+ * Порог алерта по z-score: разрыв обязан быть НЕОБЫЧНЫМ для этого символа,
+ * а не просто большим в абсолюте.
+ *
+ * Почему именно z, а не размер разрыва. Разрыв 0.3% на монете, у которой 0.3% —
+ * обычное состояние, это не расхождение, а базовая линия: измерять его нечем,
+ * пока неизвестно, что для неё норма. Замер по 135 разрешённым исходам, из
+ * которых вычеркнут IOSTUSDT (он один давал 70% всего P&L и перекрывал любую
+ * группировку):
+ *
+ *   z отсутствует (истории нет) → n=27, 19 символов, winrate 0.52, мат.ож. −0.053%
+ *   z 1..2                      → n=21,  8 символов, winrate 0.81, мат.ож. +0.059%
+ *   z ≥ 2                       → n=62, 20 символов, winrate 0.95, мат.ож. +0.176%
+ *
+ * Худшая группа — не «маленький разрыв», а «не с чем сравнить», и она
+ * единственная с отрицательным матожиданием. Размер разрыва так не делит:
+ * в полосе 0.8%+ winrate падает до 0.46 при высоком среднем, то есть крупные
+ * разрывы — это структурные расхождения вроде IOST и LSK, которые держатся
+ * часами и не сходятся вовсе.
+ *
+ * Порог применяется к АЛЕРТУ, но не к записи: перестав записывать
+ * отфильтрованное, система лишилась бы контрольной группы и больше никогда не
+ * смогла бы проверить сам фильтр. Поэтому win-rate в «Истории» отдаётся
+ * разбитым по этому порогу — см. byAlertGate.
+ */
+export const SPREAD_ALERT_MIN_Z = 2;
+
+const COOLDOWN_RAW: Record<PatternKind, number> = {
+  spread: 10 * 60_000,
+  robot: 10 * 60_000,
+  sweep: 30 * 60_000,
+  whale: 60 * 60_000,
+  funding: 60 * 60_000,
+  breakout: 20 * 60_000,
+  distribution: 30 * 60_000,
+  chop: 30 * 60_000,
+};
+
+/* Кулдаун повторной записи не может быть КОРОЧЕ горизонта исхода. Иначе одно
+   затянувшееся событие пишется как несколько сигналов, чьи окна оценки
+   перекрываются: n растёт, число независимых наблюдений — нет. Замер по
+   истории спреда: 38% исходов стартовали внутри окна предыдущего сигнала того
+   же символа, 49% интервалов между повторами были короче 30 минут, а 133
+   исхода пришли всего с 36 символов. Бутстрэп в edge.ts ресэмплил строки как
+   независимые, поэтому интервал выходил уже истинного — и вердикт «весь выше
+   нуля», открывающий алерты, считался по допущению, которое данные нарушают.
+
+   Хуже того, дубликаты копятся именно на том, что ДЛИТСЯ, — а разрыв, который
+   не закрылся, есть контрпример к тезису паттерна. Сигнал, повторно взведённый
+   внутри горизонта, — это продолжение открытого, а не новое наблюдение. */
+const COOLDOWN_MS = Object.fromEntries(
+  Object.entries(COOLDOWN_RAW).map(([k, v]) => [k, Math.max(v, HORIZON_MS)]),
+) as Record<PatternKind, number>;
+
+/** Подпись кулдауна для описания популяции — из той же константы, что его и применяет */
+const cooldownLabel = (k: PatternKind) => `не чаще раза в ${Math.round(COOLDOWN_MS[k] / 60_000)} мин на символ`;
+
+/**
  * Граница популяции для каждого типа: при каком условии сигнал вообще попал в журнал,
  * и совпадает ли это условие с тем, по которому шлётся алерт.
  *
@@ -151,7 +251,7 @@ export const RECORD_THR = {
 export type AlertScope = 'same' | 'differs' | 'none';
 export const PATTERN_POPULATION: Record<PatternKind, { population: string; alertScope: AlertScope; alertNote: string }> = {
   spread: {
-    population: `нетто-спред ≥ ${RECORD_THR.spreadNetPct}% · не чаще раза в 10 мин на символ`,
+    population: `нетто-спред ≥ ${RECORD_THR.spreadNetPct}% · ${cooldownLabel('spread')}`,
     alertScope: 'differs',
     alertNote: 'порог алерта задаётся в настройках отдельно — win-rate посчитан по всем записанным сигналам, а не по доехавшим до алерта',
   },
@@ -186,7 +286,7 @@ export const PATTERN_POPULATION: Record<PatternKind, { population: string; alert
     alertNote: 'алерт по тому же условию',
   },
   chop: {
-    population: `скор ершистости ≥ ${CHOP_SCORE_MIN} и ER ≤ ${CHOP_ER_MAX} (p10 популяции) · базовая частота исхода ${Math.round(CHOP_BASE_RATE * 100)}%`,
+    population: `ER ≤ ${CHOP_ER_MAX} · контроль — persistence ${(CHOP_PERSIST_BASE_RATE * 100).toFixed(1)}% (доля окон с пилой ПОСЛЕ окна с пилой, не доля произвольных)`,
     alertScope: 'same',
     alertNote: 'едет пометкой внутри алерта пробоя, по тому же условию',
   },
@@ -217,16 +317,8 @@ export const STOP_THR: Record<PatternKind, number> = {
   chop: 0,
 };
 
-const COOLDOWN_MS: Record<PatternKind, number> = {
-  spread: 10 * 60_000,
-  robot: 10 * 60_000,
-  sweep: 30 * 60_000,
-  whale: 60 * 60_000,
-  funding: 60 * 60_000,
-  breakout: 20 * 60_000,
-  distribution: 30 * 60_000,
-  chop: 30 * 60_000,
-};
+/* COOLDOWN_RAW / COOLDOWN_MS объявлены выше, рядом с RECORD_THR: подпись
+   популяции в PATTERN_POPULATION строится из той же константы. */
 
 export const PATTERN_META: Record<PatternKind, { icon: string; name: string; hint: string }> = {
   spread: { icon: '🔀', name: 'Спред', hint: 'сделка на разрыве: прибыль после комиссий круга (30 минут)' },
@@ -236,7 +328,13 @@ export const PATTERN_META: Record<PatternKind, { icon: string; name: string; hin
   funding: { icon: '💸', name: 'Фандинг', hint: 'ход против толпы +0.4% раньше стопа −0.4%, минус круг тейкером (30 минут)' },
   breakout: { icon: '⚡', name: 'Пробой', hint: 'ход в сторону уровня +0.5% раньше стопа −0.5% (30 минут)' },
   distribution: { icon: '📦', name: 'Раздача', hint: 'разворот против пампа/дампа +0.5% раньше стопа −0.5% (30 минут)' },
-  chop: { icon: '〰', name: 'Ёрш', hint: 'пила сохранилась: эффективность хода за следующие 30 минут ≤ 0.025 (p10 популяции) — базовая частота такого исхода 10%' },
+  chop: {
+    icon: '〰',
+    name: 'Ёрш',
+    /* Подпись собирается из тех же констант, что и решение: переписанная руками,
+       она расходится с кодом молча и ровно тогда, когда порог двигают. */
+    hint: `пила сохранилась: эффективность хода за следующие 30 минут ≤ ${CHOP_ER_MAX} — контроль ${(CHOP_PERSIST_BASE_RATE * 100).toFixed(1)}% (persistence: как часто пила держится ПОСЛЕ пилы)`,
+  },
 };
 
 /** Все типы паттернов — из PATTERN_META, чтобы список не расходился при добавлении нового */
@@ -300,7 +398,9 @@ function loadOutcomes(): Record<string, PatternOutcome> {
            выбрасываются — смешивать их в один win-rate нельзя. */
         const legacyChop =
           key.startsWith('chop:') && oc.win != null && (oc.erAfter == null || oc.erThrUsed !== CHOP_ER_MAX);
-        const stale = legacyChop || (oc.win != null && (oc.v ?? 1) < OUTCOME_VERSION);
+        const kind = kindFromKey(key);
+        const minV = (kind && OUTCOME_MIN_V[kind]) ?? OUTCOME_MIN_V_DEFAULT;
+        const stale = legacyChop || (oc.win != null && (oc.v ?? 1) < minV);
         if (stale) {
           dropped++;
           continue;
@@ -382,7 +482,7 @@ export function recentPatterns(limit = 120): Array<PatternSignal & { outcome?: P
 
 /* ---------------- Оценка исходов ---------------- */
 
-interface PathPt {
+export interface PathPt {
   ts: number;
   h: number;
   l: number;
@@ -493,14 +593,20 @@ function minuteCloses(path: PathPt[], ts0: number): number[] {
   return [...buckets.entries()].sort((a, b) => a[0] - b[0]).map(([, c]) => c);
 }
 
-function evalChopPersist(path: PathPt[], entry: number, ts0: number, erMax: number): PatternOutcome | null {
+export function evalChopPersist(path: PathPt[], entry: number, ts0: number, erMax: number): PatternOutcome | null {
   const closes = minuteCloses(path, ts0);
   if (closes.length < 12) return null; // на десятке точек эффективность — шум
   let travelled = 0;
   for (let i = 1; i < closes.length; i++) travelled += Math.abs(closes[i] - closes[i - 1]);
   if (travelled <= 0) return null;
   const net = closes[closes.length - 1] - closes[0];
-  const er = Math.abs(net) / travelled;
+  /* Та же дисциплина, что в detectChop: округлить до сравнения с порогом.
+     erAfter и erThrUsed пишутся в исход именно для того, чтобы вердикт можно было
+     перепроверить по записи, и это работает, только если win посчитан от того же
+     числа, которое записано. OUTCOME_VERSION не поднят намеренно: изменение
+     затрагивает лишь значения в пределах 5e-5 от порога, это разрешение округления,
+     а не смена методики, и пересчитывать из-за него всю историю нечего. */
+  const er = Math.round((Math.abs(net) / travelled) * 10_000) / 10_000;
   const r3 = (v: number) => Math.round(v * 1000) / 1000;
   return {
     ts: Date.now(),
@@ -510,7 +616,7 @@ function evalChopPersist(path: PathPt[], entry: number, ts0: number, erMax: numb
     win: er <= erMax,
     v: OUTCOME_VERSION,
     pnlPct: null,
-    erAfter: r3(er),
+    erAfter: er, // уже округлён выше — то же число, по которому вынесен win
     erThrUsed: erMax,
   };
 }
@@ -588,12 +694,32 @@ function simulateSpreadTrade(sig: PatternSignal, path: SpreadPt[]): PatternOutco
   };
 }
 
-/** Путь спреда из серий в памяти: кросс-спред монеты (валовый, до комиссий) */
-function spreadPathFromSeries(symbol: string): SpreadPt[] {
-  return seriesStore.getSpreadHistory(symbol).map((p) => ({ ts: p.ts, gross: p.v }));
+/**
+ * Путь спреда из серий в памяти — по КОТИРОВКАМ ИМЕННО ТОЙ ПАРЫ, на которой
+ * открывался вход.
+ *
+ * Раньше здесь стоял `getSpreadHistory(symbol)` — разрыв ЛУЧШЕЙ пары монеты на
+ * каждом тике. Лучшая пара плавает: замер по живому логу дал на LSKUSDT четыре
+ * разных биржи-контрагента за 38 минут. Путь по такой серии вычитал из входа по
+ * одной паре выход по другой, и вдобавок вход выбран как максимум по шести
+ * биржам — то есть экстремум, от которого любое следующее измерение отходит к
+ * среднему. Winrate 91% на этой ветке против 54.5% на свечах — это и есть цена
+ * подмены.
+ */
+function spreadPathFromSeries(sig: PatternSignal): SpreadPt[] {
+  if (!sig.hiEx || !sig.loEx) return [];
+  return seriesStore.getPairSpreadPath(sig.symbol, sig.hiEx, sig.loEx);
 }
 
-/** Путь спреда из 1м-клайнов обеих бирж: разрыв закрытий как прокси разрыва котировок */
+/**
+ * Путь спреда из 1м-клайнов обеих бирж: разрыв закрытий как прокси разрыва котировок.
+ *
+ * Разность ЗНАКОВАЯ и в направлении сделки: продаём на hiEx, покупаем на loEx.
+ * Прежний `(max − min)/mid` терял знак, и разошедшийся в обратную сторону разрыв
+ * выглядел точно так же, как не схлопнувшийся, — два противоположных состояния
+ * рынка под одним числом. Знаменатель — цена ноги покупки, как и на входе, а не
+ * середина: середина даёт третье выражение под тем же именем.
+ */
 async function spreadPathFromKlines(sig: PatternSignal): Promise<SpreadPt[] | null> {
   if (!sig.hiEx || !sig.loEx || !sig.hiNative || !sig.loNative) return null;
   const [hi, lo] = await Promise.all([klinesPath(sig.hiEx, sig.hiNative), klinesPath(sig.loEx, sig.loNative)]);
@@ -602,10 +728,8 @@ async function spreadPathFromKlines(sig: PatternSignal): Promise<SpreadPt[] | nu
   const out: SpreadPt[] = [];
   for (const p of hi) {
     const lc = loMap.get(Math.round(p.ts / 60_000));
-    if (!lc) continue;
-    const mid = (p.c + lc) / 2;
-    if (mid <= 0) continue;
-    out.push({ ts: p.ts, gross: ((Math.max(p.c, lc) - Math.min(p.c, lc)) / mid) * 100 });
+    if (!lc || lc <= 0) continue;
+    out.push({ ts: p.ts, gross: ((p.c - lc) / lc) * 100 });
   }
   return out.length ? out : null;
 }
@@ -618,11 +742,39 @@ export async function resolvePending(): Promise<number> {
     const arr = loadSignals();
     const out = loadOutcomes();
     const now = Date.now();
-    const pending = arr
-      .filter((s) => !out[s.key] && now - s.ts > HORIZON_MS + 2 * 60_000)
-      .sort((a, b) => a.ts - b.ts)
+    const ripe = arr.filter((s) => !out[s.key] && now - s.ts > HORIZON_MS + 2 * 60_000);
+
+    /* Просроченное закрывается СВЕРХУ и вне батча: сетевой запрос ему не нужен,
+       ответ известен заранее. Пока истечение происходило внутри батча, префикс из
+       давно просроченных съедал все RESOLVE_BATCH слотов каждый цикл: замер показал
+       очередь в 500 сигналов с головой возрастом 2295 минут при EXPIRE_MS = 360. */
+    let swept = 0;
+    for (const s of ripe) {
+      if (now - s.ts > EXPIRE_MS) {
+        out[s.key] = { ts: now, mfePct: null, maePct: null, movePct: null, win: null, expired: true };
+        swept++;
+      }
+    }
+
+    /* Очередь упорядочена по ОСТАТКУ ОЦЕНИВАЕМОСТИ, а не по возрасту.
+       Исход считается по 1м-клайнам биржи сигнала, а они покрывают только последние
+       KLINES_COVER_MS. Сигнал, чьё окно исхода уехало за это покрытие, не оценит уже
+       никто — возвращаться к нему бессмысленно. Сортировка по возрастанию ts ставила
+       первыми именно таких, и ветка klines за всю историю не дала НИ ОДНОГО исхода
+       (bySrc: series 79, klines 0) не потому, что сломана: на сигналах возрастом
+       35-49 минут она отдаёт 30 точек из 30 и считает исход штатно. До сигнала просто
+       доходили, когда оценивать его было уже нечем. Сначала те, кого ещё можно
+       оценить; внутри группы — самые старые, у них остаток окна меньше всех. */
+    const stillResolvable = (s: (typeof ripe)[number]) => now - s.ts <= KLINES_COVER_MS;
+    const pending = ripe
+      .filter((s) => !out[s.key])
+      .sort((a, b) => {
+        const ra = stillResolvable(a) ? 0 : 1;
+        const rb = stillResolvable(b) ? 0 : 1;
+        return ra !== rb ? ra - rb : a.ts - b.ts;
+      })
       .slice(0, RESOLVE_BATCH);
-    let resolved = 0;
+    let resolved = swept;
     for (const sig of pending) {
       try {
         let oc: PatternOutcome | null = null;
@@ -635,7 +787,7 @@ export async function resolvePending(): Promise<number> {
           return o;
         };
         if (sig.pattern === 'spread' && (sig.netPct != null || sig.spreadPct != null)) {
-          oc = from(simulateSpreadTrade(sig, spreadPathFromSeries(sig.symbol)), 'series');
+          oc = from(simulateSpreadTrade(sig, spreadPathFromSeries(sig)), 'series');
           if (!oc) {
             const path = await spreadPathFromKlines(sig);
             if (path) oc = from(simulateSpreadTrade(sig, path), 'klines');
@@ -651,10 +803,22 @@ export async function resolvePending(): Promise<number> {
           if (erMax == null) {
             unresolvable = true;
           } else {
-            oc = from(evalChopPersist(seriesPath(sig.symbol, sig.ex), sig.price, sig.ts, erMax), 'series');
-            if (!oc && sig.ex && sig.native) {
+            /* Клайны ПЕРВЫМИ, серия — запасной вариант, а не наоборот.
+               Исход ерша определён на поминутных закрытиях: путь цены суммируется
+               по ним, и чем реже взяты точки, тем короче получается путь и тем ВЫШЕ
+               выходит ER — смещение одностороннее, прямо против срабатывания. Серия
+               пишется с шагом скана (замер по series.json: ~150 с между точками,
+               местами 490), то есть даёт 12 точек там, где нужно 30, и ровно на
+               границе своего же минимума в evalChopPersist. Клайны дают 30 из 30
+               (проверено на сигналах возрастом 35-49 минут). Стоявшая первой серия
+               выигрывала у более точного источника просто потому, что возвращала
+               непустой результат. */
+            if (sig.ex && sig.native) {
               const path = await klinesPath(sig.ex, sig.native);
               if (path) oc = from(evalChopPersist(path, sig.price, sig.ts, erMax), 'klines');
+            }
+            if (!oc) {
+              oc = from(evalChopPersist(seriesPath(sig.symbol, sig.ex), sig.price, sig.ts, erMax), 'series');
             }
           }
         } else if (sig.dir !== 'arb') {
@@ -724,6 +888,14 @@ export interface PatternStat {
   alertNote: string;
   avgMaeWin: number | null; // средняя просадка у выигравших, % — цена, которую пришлось пересидеть
   edge: EdgeReport; // матожидание с доверительным интервалом, вердикт и флаг выключения
+  /* Затвор алерта против своей контрольной группы: passed — то, что доезжает до
+     оператора, blocked — то, что отфильтровано. Фильтр без контрольной группы
+     недоказуем, поэтому запись идёт по обеим. null у типов без своего затвора. */
+  byAlertGate: {
+    minZ: number;
+    passed: { n: number; winRate: number | null; expectancyPct: number | null };
+    blocked: { n: number; winRate: number | null; expectancyPct: number | null };
+  } | null;
 }
 
 /* ---------------- Эдж и авто-отключение ---------------- */
@@ -733,14 +905,23 @@ export interface PatternStat {
  * Только разрешённые исходы: истёкшие (win == null) — это отсутствие данных, а не ноль,
  * и включать их в матожидание нельзя ни как ноль, ни как убыток.
  */
-function pnlSequences(): Record<PatternKind, number[]> {
+/* Вместе с P&L отдаётся символ каждого исхода: он и есть независимая единица
+   наблюдения. Строки одного символа коррелированы (повторные сработки на одном
+   затянувшемся разрыве), и интервал в edge.ts обязан ресэмплить символы, а не
+   строки, иначе он сужается пропорционально дублированию. */
+function pnlSequences(): Record<PatternKind, { pnl: number[]; sym: string[] }> {
   const arr = loadSignals();
   const out = loadOutcomes();
-  const seq = Object.fromEntries(ALL_KINDS.map((k) => [k, [] as number[]])) as Record<PatternKind, number[]>;
+  const seq = Object.fromEntries(
+    ALL_KINDS.map((k) => [k, { pnl: [] as number[], sym: [] as string[] }])
+  ) as Record<PatternKind, { pnl: number[]; sym: string[] }>;
   for (const s of arr) {
     const oc = out[s.key];
     if (!oc || oc.win == null || oc.pnlPct == null) continue;
-    seq[s.pattern]?.push(oc.pnlPct);
+    const t = seq[s.pattern];
+    if (!t) continue;
+    t.pnl.push(oc.pnlPct);
+    t.sym.push(s.symbol);
   }
   return seq;
 }
@@ -752,7 +933,7 @@ function pnlSequences(): Record<PatternKind, number[]> {
    в своих единицах и против своей базовой частоты. Значение — доля произвольных окон
    популяции, в которых исход выполняется сам собой. */
 const RATE_BASELINE: Partial<Record<PatternKind, number>> = {
-  chop: CHOP_BASE_RATE,
+  chop: CHOP_PERSIST_BASE_RATE,
 };
 
 /**
@@ -789,7 +970,7 @@ export function patternEdges(): Record<PatternKind, EdgeReport> {
   const v = Object.fromEntries(
     ALL_KINDS.map((k) => {
       const base = RATE_BASELINE[k];
-      return [k, base != null ? computeRateEdge(hits[k], base) : computeEdge(seq[k])];
+      return [k, base != null ? computeRateEdge(hits[k], base) : computeEdge(seq[k].pnl, seq[k].sym)];
     })
   ) as Record<PatternKind, EdgeReport>;
   edgeCache = { ts: Date.now(), signals: nSig, outcomes: nOut, v };
@@ -806,6 +987,107 @@ export function patternEdges(): Record<PatternKind, EdgeReport> {
  */
 export function isPatternMuted(kind: PatternKind): boolean {
   return patternEdges()[kind]?.muted ?? false;
+}
+
+
+/* ===================== ЁРШ КАК ФИЛЬТР ПРОБОЕВ =====================
+
+   Собственное утверждение ерша — не «пила продержится ещё полчаса», а «пробои
+   при высокой ершистости ложные». Это разные проверки, и вторая до сих пор не
+   считалась, хотя данные для неё пишутся давно: chopScore сохраняется на КАЖДОМ
+   сигнале пробоя, а исход пробоя оценивается штатно. Отчёт ниже и есть проверка
+   заявления, ради которого детектор существует.
+
+   Контроль здесь — не внешняя константа, а нижняя полоса ершистости на той же
+   популяции: обе полосы это пробои, оценённые одним правилом выхода на одном
+   горизонте, поэтому разность между ними и есть вклад фильтра.
+
+   Отдельно печатается noScore — пробои, у которых ершистость не записана. Их
+   нельзя молча выкинуть: критерий, привязанный к необязательному полю, тихо
+   освобождает от проверки всех, у кого поля нет, и покрытие надо видеть цифрой. */
+
+/** Границы полос по ершистости. Одна таблица на подписи и на раскладку: подпись,
+    набранная отдельно от границы, расходится с ней молча. */
+const CHOP_BANDS: ReadonlyArray<{ from: number; to: number | null }> = [
+  { from: 0, to: 15 },
+  { from: 15, to: 30 },
+  { from: 30, to: 45 },
+  { from: 45, to: null },
+];
+
+export interface ChopFilterBand {
+  label: string;
+  from: number;
+  to: number | null;
+  n: number;
+  wins: number;
+  winRate: number | null;
+  ciLo: number | null;
+  ciHi: number | null;
+}
+
+export interface ChopFilterReport {
+  /** Пробои с записанной ершистостью И оценённым исходом — популяция отчёта */
+  n: number;
+  /** Пробои с исходом, но БЕЗ записанной ершистости: вне проверки, показываем явно */
+  noScore: number;
+  /** Общий win-rate пробоя на этой же популяции — с чем сравнивать полосы */
+  overall: number | null;
+  bands: ChopFilterBand[];
+  claim: string;
+}
+
+export function chopFilterReport(): ChopFilterReport {
+  const arr = loadSignals();
+  const out = loadOutcomes();
+  const bands = CHOP_BANDS.map((b) => ({
+    label: b.to == null ? `${b.from}+` : `${b.from}–${b.to - 1}`,
+    from: b.from,
+    to: b.to,
+    n: 0,
+    wins: 0,
+    winRate: null as number | null,
+    ciLo: null as number | null,
+    ciHi: null as number | null,
+  }));
+  let n = 0;
+  let wins = 0;
+  let noScore = 0;
+  for (const sig of arr) {
+    if (sig.pattern !== 'breakout') continue;
+    const oc = out[sig.key];
+    if (!oc || oc.win == null) continue; // истёкшие — отсутствие данных, а не промах
+    if (sig.chopScore == null) {
+      noScore++;
+      continue;
+    }
+    const c = sig.chopScore;
+    const band = bands.find((b) => c >= b.from && (b.to == null || c < b.to));
+    if (!band) continue;
+    band.n++;
+    n++;
+    if (oc.win) {
+      band.wins++;
+      wins++;
+    }
+  }
+  for (const b of bands) {
+    if (!b.n) continue;
+    b.winRate = b.wins / b.n;
+    const ci = wilsonInterval(b.wins, b.n);
+    b.ciLo = ci ? ci.lo : null;
+    b.ciHi = ci ? ci.hi : null;
+  }
+  return {
+    n,
+    noScore,
+    overall: n ? wins / n : null,
+    bands,
+    claim:
+      'Заявление ерша: чем выше ершистость на момент пробоя, тем чаще пробой ложный. ' +
+      'Подтверждением считается win-rate верхних полос НИЖЕ нижней полосы, с неперекрывающимися интервалами. ' +
+      'Пока интервалы перекрываются, эффекта не измерено — это не то же самое, что измеренное отсутствие эффекта.',
+  };
 }
 
 export function patternStats(): { stats: PatternStat[]; anyWaiting: number } {
@@ -836,6 +1118,13 @@ export function patternStats(): { stats: PatternStat[]; anyWaiting: number } {
     let costN = 0;
     const byExit = { tp: 0, sl: 0, timeout: 0, converged: 0 };
     const bySrc = { series: 0, klines: 0, unknown: 0 };
+    /* Win-rate, разбитый по затвору алерта. Фильтр, поставленный перед выдачей,
+       делает опубликованную цифру описанием ДРУГОЙ популяции, чем та, на которой
+       он выбран, — и проверить его больше нечем, если отфильтрованное перестать
+       считать. Поэтому запись идёт по всем сигналам, а обе группы показываются
+       рядом: контрольная группа и есть единственное доказательство, что затвор
+       работает. */
+    const gate = { passed: { n: 0, wins: 0, pnl: 0 }, blocked: { n: 0, wins: 0, pnl: 0 } };
     for (const s of sigs) {
       const oc = out[s.key];
       if (!oc) {
@@ -847,6 +1136,12 @@ export function patternStats(): { stats: PatternStat[]; anyWaiting: number } {
         continue;
       }
       resolved++;
+      if (k === 'spread') {
+        const g = s.zScore != null && s.zScore >= SPREAD_ALERT_MIN_Z ? gate.passed : gate.blocked;
+        g.n++;
+        if (oc.win) g.wins++;
+        g.pnl += oc.pnlPct ?? 0;
+      }
       bySrc[oc.src ?? 'unknown']++;
       if (oc.exit) byExit[oc.exit]++;
       if (oc.pnlPct != null) {
@@ -900,6 +1195,24 @@ export function patternStats(): { stats: PatternStat[]; anyWaiting: number } {
       ...PATTERN_POPULATION[k],
       avgMaeWin: maeWinN ? Math.round((maeWinSum / maeWinN) * 100) / 100 : null,
       edge: edges[k],
+      /* Затвор алерта против своей контрольной группы. Есть только у спреда —
+         у остальных затвор совпадает с порогом записи, и делить нечего. */
+      byAlertGate:
+        k === 'spread'
+          ? {
+              minZ: SPREAD_ALERT_MIN_Z,
+              passed: {
+                n: gate.passed.n,
+                winRate: gate.passed.n ? Math.round((gate.passed.wins / gate.passed.n) * 1000) / 1000 : null,
+                expectancyPct: gate.passed.n ? Math.round((gate.passed.pnl / gate.passed.n) * 1000) / 1000 : null,
+              },
+              blocked: {
+                n: gate.blocked.n,
+                winRate: gate.blocked.n ? Math.round((gate.blocked.wins / gate.blocked.n) * 1000) / 1000 : null,
+                expectancyPct: gate.blocked.n ? Math.round((gate.blocked.pnl / gate.blocked.n) * 1000) / 1000 : null,
+              },
+            }
+          : null,
     };
   });
   return { stats, anyWaiting: stats.reduce((a, s) => a + s.waiting, 0) };

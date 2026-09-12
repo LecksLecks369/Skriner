@@ -14,7 +14,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "MetaScreener ×6 — межбиржевые неэффективности",
+  title: "MetaScreener ×7 — межбиржевые неэффективности",
   description: "Скринер межбиржевых спредов: Bybit, BingX, OKX, Bitget, MEXC, Ourbit",
   keywords: ["Z.ai", "Next.js", "TypeScript", "Tailwind CSS", "shadcn/ui", "AI development", "React"],
   authors: [{ name: "Z.ai Team" }],

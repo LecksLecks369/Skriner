@@ -136,6 +136,8 @@ export async function POST(req: NextRequest) {
       score: body.score,
       sizeUsd: body.sizeUsd,
       slipRoundTripPct: body.slipRoundTripPct,
+      // нетто-фандинг обеих ног, %/час: стоимость удержания, а не входа
+      fundingHourlyPct: body.fundingHourlyPct,
     });
     return NextResponse.json({ ok: true, trade });
   } catch (e) {

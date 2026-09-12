@@ -24,6 +24,12 @@ async function fetchJson<T>(url: string, timeoutMs = 9000): Promise<T> {
    отдаёт максимум 100 независимо от limit — такие книги помечаются как усечённые. */
 export const BOOK_LEVELS = 200;
 
+/* Глубина 1м-клайнов: одна константа на всех, потому что от неё зависит не только
+   загрузка, но и ОЦЕНИВАЕМОСТЬ исхода — резолвер по ней считает, какие сигналы ещё
+   можно дооценить. Пока число стояло пятью отдельными дефолтами, у резолвера не было
+   способа узнать покрытие, кроме как завести шестое. */
+export const KLINES_BARS = 90;
+
 /** Число из поля тикера; null, если поля нет или оно не положительное */
 function numOrNull(v: unknown): number | null {
   const n = typeof v === 'number' ? v : parseFloat(String(v ?? ''));
@@ -77,7 +83,7 @@ async function fetchBybit(): Promise<ExchangeFetchResult> {
   return { exchange: 'bybit', ok: true, tickers, fetchedAt: Date.now(), lagMs: Date.now() - t0 };
 }
 
-async function fetchBybitKlines(native: string, limit = 90): Promise<Candle[]> {
+async function fetchBybitKlines(native: string, limit = KLINES_BARS): Promise<Candle[]> {
   const j = await fetchJson<{ retCode: number; result?: { list?: string[][] } }>(
     `https://api.bybit.com/v5/market/kline?category=linear&symbol=${native}&interval=1&limit=${limit}`
   );
@@ -154,7 +160,7 @@ async function fetchBinance(): Promise<ExchangeFetchResult> {
   return { exchange: 'binance', ok: true, tickers, fetchedAt: Date.now(), lagMs: Date.now() - t0 };
 }
 
-async function fetchBinanceKlines(native: string, limit = 90): Promise<Candle[]> {
+async function fetchBinanceKlines(native: string, limit = KLINES_BARS): Promise<Candle[]> {
   const j = await fetchJson<Array<Array<string | number>>>(
     `${BINANCE_FAPI}/klines?symbol=${native}&interval=1m&limit=${limit}`,
     12_000
@@ -213,7 +219,7 @@ async function fetchBingx(): Promise<ExchangeFetchResult> {
   return { exchange: 'bingx', ok: true, tickers, fetchedAt: Date.now(), lagMs: Date.now() - t0 };
 }
 
-async function fetchBingxKlines(native: string, limit = 90): Promise<Candle[]> {
+async function fetchBingxKlines(native: string, limit = KLINES_BARS): Promise<Candle[]> {
   const j = await fetchJson<{ code: number; data?: Array<Record<string, unknown>> }>(
     `https://open-api.bingx.com/openApi/swap/v2/quote/klines?symbol=${native}&interval=1m&limit=${limit}`
   );
@@ -279,11 +285,29 @@ export async function fetchBingxTaker(native: string): Promise<number | null> {
 }
 
 /* ---------------- OKX ---------------- */
+/* Размер контракта OKX по instId, заполняется на каждом fetchOkx.
+   Та же история, что у MEXC: /market/books отдаёт объёмы уровней В КОНТРАКТАХ, а
+   ctVal у 211 из 463 USDT-свопов не равен единице (DOGE и IOST — 1000 монет в
+   контракте, XRP — 100, BTC — 0.01, ETH — 0.1). Без пересчёта лучший уровень
+   DOGE выходил $6 вместо $6399: слипейдж на $1k не набирался, и нога OKX молча
+   выпадала из симулятора. У BTC и ETH ошибка обратная — книга казалась в 100 и
+   10 раз глубже, а слипейдж заниженным. */
+const okxContractSize = new Map<string, number>();
+
 async function fetchOkx(): Promise<ExchangeFetchResult> {
   const t0 = Date.now();
-  const j = await fetchJson<{ code: string; data?: Array<Record<string, string>> }>(
-    'https://www.okx.com/api/v5/market/tickers?instType=SWAP'
-  );
+  const [j, inst] = await Promise.all([
+    fetchJson<{ code: string; data?: Array<Record<string, string>> }>(
+      'https://www.okx.com/api/v5/market/tickers?instType=SWAP'
+    ),
+    fetchJson<{ code: string; data?: Array<Record<string, string>> }>(
+      'https://www.okx.com/api/v5/public/instruments?instType=SWAP'
+    ).catch(() => null),
+  ]);
+  for (const d of inst?.data || []) {
+    const v = Number(d.ctVal);
+    if (d.instId && isFinite(v) && v > 0) okxContractSize.set(d.instId, v);
+  }
   if (j.code !== '0' || !j.data) throw new Error('okx code!=0');
   const tickers: RawTicker[] = [];
   for (const t of j.data) {
@@ -306,7 +330,7 @@ async function fetchOkx(): Promise<ExchangeFetchResult> {
   return { exchange: 'okx', ok: true, tickers, fetchedAt: Date.now(), lagMs: Date.now() - t0 };
 }
 
-async function fetchOkxKlines(native: string, limit = 90): Promise<Candle[]> {
+async function fetchOkxKlines(native: string, limit = KLINES_BARS): Promise<Candle[]> {
   const j = await fetchJson<{ code: string; data?: string[][] }>(
     `https://www.okx.com/api/v5/market/candles?instId=${native}&bar=1m&limit=${limit}`
   );
@@ -465,7 +489,7 @@ async function fetchMexc(): Promise<ExchangeFetchResult> {
   return { exchange: 'mexc', ok: true, tickers, fetchedAt: Date.now(), lagMs: Date.now() - t0 };
 }
 
-async function fetchMexcKlines(native: string, limit = 90): Promise<Candle[]> {
+async function fetchMexcKlines(native: string, limit = KLINES_BARS): Promise<Candle[]> {
   const end = Date.now();
   const start = end - 100 * 60 * 1000;
   const j = await fetchJson<{ success: boolean; data?: { time?: number[]; open?: number[]; close?: number[]; high?: number[]; low?: number[]; vol?: number[]; amount?: number[] } }>(
@@ -837,11 +861,18 @@ export async function fetchOrderbook(ex: ExchangeId, native: string): Promise<Bo
       return { bids: lv(j.data.bids), asks: lv(j.data.asks) };
     }
     if (ex === 'okx') {
+      /* Уровни приходят в КОНТРАКТАХ; без ctVal их не перевести в монеты, и
+         подставлять 1 нельзя — у 211 из 463 свопов это неверно, причём ошибка
+         идёт в обе стороны (DOGE занижен в 1000 раз, BTC завышен в 100). */
+      const size = okxContractSize.get(native);
+      if (!size) return null;
       const j = await fetchJson<{ code: string; data?: Array<{ bids?: string[][]; asks?: string[][] }> }>(
         `https://www.okx.com/api/v5/market/books?instId=${native}&sz=${BOOK_LEVELS}`, 7000);
       if (j.code !== '0' || !j.data?.[0]) return null;
       const lv = (arr?: string[][]): BookLevel[] =>
-        (arr || []).map((r) => ({ p: parseFloat(r[0]), s: parseFloat(r[1]) })).filter((l) => l.p > 0 && l.s > 0);
+        (arr || [])
+          .map((r) => ({ p: parseFloat(r[0]), s: parseFloat(r[1]) * size }))
+          .filter((l) => l.p > 0 && l.s > 0);
       return { bids: lv(j.data[0].bids), asks: lv(j.data[0].asks) };
     }
     if (ex === 'bitget') {

@@ -10,9 +10,22 @@ interface Pt {
   v: number;
 }
 
+/** Котировка одной биржи в момент ts: лучший бид и лучший аск */
+export interface QPt {
+  ts: number;
+  b: number;
+  a: number;
+}
+
 export interface Series {
   prices: Record<string, Record<string, Pt[]>>; // symbol -> exchange -> [ts, price]
-  crossSpread: Record<string, Pt[]>; // symbol -> [ts, pct]
+  /* Котировки ПО БИРЖАМ — чтобы путь разрыва считался по той же паре и тем же
+     выражением, что и вход. crossSpread ниже хранит разрыв ЛУЧШЕЙ пары на каждом
+     тике, а лучшая пара меняется: на LSKUSDT за 38 минут контрагентом побывали
+     четыре биржи подряд. Путь по такой серии сравнивает вход по одной паре с
+     выходом по другой, и результат описывает перестановку пар, а не сделку. */
+  quotes: Record<string, Record<string, QPt[]>>; // symbol -> exchange -> [ts, bid, ask]
+  crossSpread: Record<string, Pt[]>; // symbol -> [ts, pct] — ЛУЧШАЯ пара, для z-score и графика
   oi: Record<string, Record<string, Pt[]>>; // symbol -> exchange -> [ts, oi]
   funding: Record<string, Record<string, Pt[]>>; // symbol -> exchange -> [ts, rate]
   firstSignal: Record<string, number>; // symbol -> ts первого сигнала (спред >= порога)
@@ -38,7 +51,7 @@ const DATA_DIR = path.join(process.cwd(), 'data');
 const JOURNAL_FILE = path.join(DATA_DIR, 'signal_journal.jsonl');
 
 function newSeries(): Series {
-  return { prices: {}, crossSpread: {}, oi: {}, funding: {}, firstSignal: {}, lastSignalTs: {} };
+  return { prices: {}, quotes: {}, crossSpread: {}, oi: {}, funding: {}, firstSignal: {}, lastSignalTs: {} };
 }
 
 interface StoreGlobal {
@@ -49,6 +62,23 @@ if (!g.__screenerStore) {
   g.__screenerStore = { series: newSeries(), journal: [], journalLoaded: false };
 }
 const store = g.__screenerStore;
+
+/**
+ * Достроить недостающие разделы Series на живом объекте.
+ *
+ * `store.series` живёт в globalThis и переживает hot-reload: объект создаётся
+ * ОДИН раз, той версией `newSeries()`, что была в процессе на момент старта.
+ * Добавление нового раздела правит только конструктор — у уже живущего объекта
+ * поля по-прежнему нет, и первое же обращение падает на `undefined`. Ровно это и
+ * случилось при добавлении `quotes`: `[scan] failed: Cannot read properties of
+ * undefined (reading 'ETHUSDT')` на каждом скане, при том что типы сходились, а
+ * линтер молчал — оба видят конструктор, а не объект в памяти.
+ *
+ * Тот же случай — series.json, записанный прошлой версией: в нём раздела тоже нет.
+ */
+function ensureQuotes(): Record<string, Record<string, QPt[]>> {
+  return (store.series.quotes ||= {});
+}
 
 function pushPt(arr: Pt[] | undefined, ts: number, v: number): Pt[] {
   const a = arr || [];
@@ -74,8 +104,43 @@ export const seriesStore = {
     const s = (store.series.funding[symbol] ||= {});
     s[ex] = pushPt(s[ex], ts, rate);
   },
+  addQuote(symbol: string, ex: ExchangeId, ts: number, bid: number, ask: number) {
+    const s = (ensureQuotes()[symbol] ||= {});
+    const arr = (s[ex] ||= []);
+    const last = arr[arr.length - 1];
+    if (last && ts - last.ts < 30_000 && last.b === bid && last.a === ask) return;
+    arr.push({ ts, b: bid, a: ask });
+    if (arr.length > MAX_PTS) arr.splice(0, arr.length - MAX_PTS);
+  },
   getSpreadHistory(symbol: string): Pt[] {
     return store.series.crossSpread[symbol] || [];
+  },
+  /**
+   * Путь ВАЛОВОГО разрыва конкретной пары бирж: продаём в бид на hiEx, покупаем
+   * в аск на loEx — ровно то выражение, по которому считался вход.
+   *
+   * Знак сохраняется: отрицательное значение означает, что книги разошлись в
+   * обратную сторону, и это не то же самое, что схлопывание. Модуль разности,
+   * который стоял в ветке свечей, делает эти два состояния неразличимыми и
+   * показывает разошедшийся разрыв как несошедшийся.
+   *
+   * Тики обеих бирж пишутся одним и тем же `now` внутри одного скана, поэтому
+   * соединение идёт по точному ts — никакого сглаживания и никакой интерполяции.
+   */
+  getPairSpreadPath(symbol: string, hiEx: ExchangeId, loEx: ExchangeId): Array<{ ts: number; gross: number }> {
+    const per = ensureQuotes()[symbol];
+    if (!per) return [];
+    const hi = per[hiEx];
+    const lo = per[loEx];
+    if (!hi?.length || !lo?.length) return [];
+    const loBy = new Map(lo.map((p) => [p.ts, p]));
+    const out: Array<{ ts: number; gross: number }> = [];
+    for (const h of hi) {
+      const l = loBy.get(h.ts);
+      if (!l || !(l.a > 0)) continue;
+      out.push({ ts: h.ts, gross: ((h.b - l.a) / l.a) * 100 });
+    }
+    return out;
   },
   /** Все серии цен монеты по биржам (для оценки исходов паттернов) */
   getPricePoints(symbol: string): Record<string, Pt[]> {
@@ -117,7 +182,14 @@ export const seriesStore = {
     const mean = hist.reduce((a, b) => a + b, 0) / n;
     const varr = hist.reduce((a, b) => a + (b - mean) * (b - mean), 0) / n;
     const std = Math.sqrt(varr);
-    if (std < 1e-6) return cur > mean + 0.05 ? 3.5 : null; // стабильный спред + внезапный скачок
+    /* Нулевая дисперсия — это «разброс не измерен», а не «отклонение огромно».
+       Здесь стояло `return 3.5`: выдуманное значение, которое проходит любой
+       порог. А ряд из одинаковых значений — типовой признак замороженного
+       фида, то есть ровно того случая, по которому алертить нельзя. Из двух
+       ошибок обратима только одна: пропущенный скачок на стабильном спреде
+       виден и дождётся следующих тиков, когда дисперсия появится, а сделка по
+       залипшей котировке не видна никак. */
+    if (std < 1e-6) return null;
     return Math.max(-5, Math.min(8, (cur - mean) / std));
   },
   /** Возраст сигнала: ставим метку, пока спред выше порога, и снимаем, когда он опустился ниже.
@@ -354,6 +426,14 @@ export function warmupSeries() {
         if (pr.length) np[ex] = pr;
       }
       if (Object.keys(np).length) next.prices[sym] = np;
+    }
+    for (const [sym, per] of Object.entries(raw.quotes || {})) {
+      const np: Record<string, QPt[]> = {};
+      for (const [ex, arr] of Object.entries(per)) {
+        const pr = (arr || []).filter((p) => p.ts >= cutoff).slice(-MAX_PTS);
+        if (pr.length) np[ex] = pr;
+      }
+      if (Object.keys(np).length) next.quotes[sym] = np;
     }
     for (const [sym, arr] of Object.entries(raw.crossSpread || {})) {
       const pr = prunePts(arr, cutoff);

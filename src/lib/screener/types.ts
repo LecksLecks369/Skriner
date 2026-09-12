@@ -195,6 +195,11 @@ export interface ExDepth {
   depth25Usd: number; // ±0.25%
   depth50Usd: number; // ±0.5%
   bookSpreadPct: number; // нативный спред стакана
+  /* Лестница размеров начинается с $1k: на неликвиде разрыв в 0.3-1% съедается
+     кругом уже на $25k, и единственный содержательный ответ — не «эджа нет», а
+     «эдж есть до такого-то объёма». Без нижних ступеней этот ответ не построить. */
+  slip1kPct: number | null;
+  slip5kPct: number | null;
   slip10kPct: number | null; // проскальзывание рыночного ордера $10k (худшая сторона), %
   slip25kPct: number | null;
   slip50kPct: number | null;
@@ -239,7 +244,13 @@ export interface LiquidityDeep {
   exitEx: ExchangeId | null; // где продать дороже (bestBid)
   slip25kPct: number | null; // худший слипейдж $25k среди entry/exit
   slipRoundTripPct: number | null; // слипейдж обеих ног круга: вход + выход, %
-  slipBudgetUsd: number | null; // на каком объёме измерен slipRoundTripPct ($25k, иначе $10k)
+  slipBudgetUsd: number | null; // на каком объёме измерен slipRoundTripPct (верхняя доступная ступень лестницы)
+  /* Наибольший размер из лестницы, на котором круг ещё окупается:
+     netSpread − 2×слипейдж круга > 0. null — не окупается нигде, даже на $1k. */
+  arbMaxSizeUsd: number | null;
+  /* Слипейдж круга на каждой ступени: [размер $, слипейдж круга %, исполнимый спред %].
+     Ступень, где книга не набирает объём, отсутствует в списке. */
+  arbSizeLadder: Array<{ usd: number; slipRoundTripPct: number; netExecPct: number }>;
   maxPosUsd: number | null; // минимальный безопасный размер среди entry/exit
   maxPosTruncated: boolean; // хотя бы одна книга кончилась раньше порога — значение занижено
   tape: TapeStats | null;
@@ -299,7 +310,15 @@ export interface PaperTrade {
   slipRoundTripPct?: number; // слипейдж обеих ног на входе (из deep-блока), %
   slipModeled?: boolean; // false = стакан был недоступен, P&L завышен на величину слипейджа
   feesPct?: number; // комиссии полного круга (пара бирж дважды), %
-  costPct?: number; // полные издержки круга: комиссии + проскальзывание входа и выхода, %
+  /* Стоимость УДЕРЖАНИЯ: фандинг обеих ног, % от номинала в час, снят на входе.
+     Позиция маркет-нейтральна по цене, но не по фандингу: длинная нога платит
+     свою ставку, короткая получает свою, и на среднем удержании в 3.4 часа это
+     слагаемое крупнее комиссий. Замер: на IOSTUSDT ставки были −0.0994%/час
+     (binance) и −0.1428%/час (bybit) при разрыве 0.6%. */
+  fundingHourlyPct?: number;
+  fundingCostPct?: number; // fundingHourlyPct × фактические часы в позиции
+  fundingModeled?: boolean; // false = ставок не было в скане, стоимость удержания не учтена
+  costPct?: number; // полные издержки круга: комиссии + проскальзывание входа и выхода + фандинг, %
   pnlModelV?: number; // версия модели P&L; сделки старых версий пересчитываются при загрузке
 }
 
@@ -315,6 +334,10 @@ export interface ScanResponse {
      PERP-суффикс), датированные поставочные, стейбл к стейблу. Число на виду намеренно —
      его скачок означает, что биржа изменила состав листинга. */
   excludedAsNonPerp: number;
+  /* Стадии обогащения, пропущенные из-за бюджета времени. Пустой список = скан успел
+     целиком. Список на виду намеренно: молча усечённый ответ неотличим от сломанной
+     биржи — пустая колонка читается как «данных нет», а не «не успели спросить». */
+  skippedStages: string[];
   statuses: ExchangeStatus[];
   errors: Record<string, string>;
   refExchange: ExchangeId | 'auto';

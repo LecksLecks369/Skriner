@@ -83,6 +83,8 @@ export function analyzeBook(book: Book): ExDepth | null {
     depth25Usd: depthWithin(book.asks, mid, 0.0025, 'ask') + depthWithin(book.bids, mid, 0.0025, 'bid'),
     depth50Usd: depthWithin(book.asks, mid, 0.005, 'ask') + depthWithin(book.bids, mid, 0.005, 'bid'),
     bookSpreadPct: ((bestAsk - bestBid) / mid) * 100,
+    slip1kPct: slip(1_000),
+    slip5kPct: slip(5_000),
     slip10kPct: slip(10_000),
     slip25kPct: slip(25_000),
     slip50kPct: slip(50_000),
@@ -377,9 +379,11 @@ export function assembleDeep(inp: DeepInput): LiquidityDeep {
      мельче ордера, и тогда монета осталась бы «без измеренных издержек» именно
      из-за того, что она неликвидная. Если и $10k не набирается — null остаётся,
      и скоринг не даёт за такой спред баллов. */
-  const budgets: Array<[number, 'slip25kPct' | 'slip10kPct']> = [
+  const budgets: Array<[number, 'slip25kPct' | 'slip10kPct' | 'slip5kPct' | 'slip1kPct']> = [
     [25_000, 'slip25kPct'],
     [10_000, 'slip10kPct'],
+    [5_000, 'slip5kPct'],
+    [1_000, 'slip1kPct'],
   ];
   let slipRoundTrip: number | null = null;
   let slipBudgetUsd: number | null = null;
@@ -391,6 +395,27 @@ export function assembleDeep(inp: DeepInput): LiquidityDeep {
       slipBudgetUsd = usd;
       break;
     }
+  }
+
+  /* Лестница «размер → исполнимый спред». Один размер отвечает не на тот вопрос:
+     на $25k круг съедает разрыв почти всегда, и ответ «эджа нет» — это ответ про
+     выбранный объём, а не про сигнал. Замер независимым опросом стаканов: на
+     IOSTUSDT разрыв 0.765% валовый давал +0.48% на $1k, +0.27% на $5k и не
+     набирался вовсе на $25k. Круг — ДВА пересечения книг (вход и выход), поэтому
+     из спреда вычитается 2×slipRoundTrip. */
+  const arbSizeLadder: Array<{ usd: number; slipRoundTripPct: number; netExecPct: number }> = [];
+  let arbMaxSizeUsd: number | null = null;
+  if (inp.netSpreadPct != null) {
+    for (const [usd, key] of budgets) {
+      const e = inp.entryEx ? inp.depths[inp.entryEx]?.[key] ?? null : null;
+      const x = inp.exitEx ? inp.depths[inp.exitEx]?.[key] ?? null : null;
+      if (e == null || x == null) continue;
+      const rt = Math.round((e + x) * 1000) / 1000;
+      const net = Math.round((inp.netSpreadPct - 2 * rt) * 1000) / 1000;
+      arbSizeLadder.push({ usd, slipRoundTripPct: rt, netExecPct: net });
+      if (net > 0 && (arbMaxSizeUsd == null || usd > arbMaxSizeUsd)) arbMaxSizeUsd = usd;
+    }
+    arbSizeLadder.sort((a, b) => b.usd - a.usd);
   }
   const algo = algoScoreOf({ tape: inp.tape, volZ: inp.volZ, dOiPct15m: inp.dOiPct15m, sweepAgeMin: inp.sweepAgeMin });
   const illiq = illiqScoreOf(depth25, slip25k, inp.amihud, inp.turnoverUsd);
@@ -422,6 +447,8 @@ export function assembleDeep(inp: DeepInput): LiquidityDeep {
     slip25kPct: slip25k,
     slipRoundTripPct: slipRoundTrip,
     slipBudgetUsd,
+    arbMaxSizeUsd,
+    arbSizeLadder,
     maxPosUsd: maxPos,
     maxPosTruncated,
     tape: inp.tape,

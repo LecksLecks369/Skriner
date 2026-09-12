@@ -48,6 +48,31 @@ export function arbPnlPct(netEntry: number, netExit: number, costPct: number): n
   return netEntry - netExit - costPct;
 }
 
+/** Стоимость удержания: нетто-фандинг обеих ног × время в позиции, % от номинала */
+export function arbHoldCostPct(fundingHourlyPct: number | null | undefined, heldMs: number): number {
+  if (fundingHourlyPct == null || !Number.isFinite(fundingHourlyPct)) return 0;
+  return (fundingHourlyPct * Math.max(0, heldMs)) / 3_600_000;
+}
+
+/**
+ * Полные издержки сделки: комиссии круга + слипейдж входа и выхода + фандинг удержания.
+ *
+ * Живёт здесь, а не в paper.ts, потому что считают их ДВОЕ: сервер при закрытии и
+ * панель при показе открытой позиции. Пока выражение было только серверным, панель
+ * складывала свою версию из arbCostPct и показывала P&L без стоимости удержания —
+ * то есть цифра на экране и цифра в журнале расходились тем сильнее, чем дольше
+ * висела позиция, и обе выглядели правдоподобно.
+ */
+export function arbTotalCostPct(
+  a: ExchangeId,
+  b: ExchangeId,
+  slipRoundTripPct: number | null | undefined,
+  fundingHourlyPct: number | null | undefined,
+  heldMs: number
+): number {
+  return arbCostPct(a, b, slipRoundTripPct) + arbHoldCostPct(fundingHourlyPct, heldMs);
+}
+
 /** Максимум, который сделка может дать: спред схлопнулся в ноль. ≤0 = сделка убыточна изначально */
 export function arbMaxPnlPct(netEntry: number, costPct: number): number {
   return netEntry - costPct;
@@ -79,4 +104,32 @@ export function arbSlLevelPct(netEntry: number): number {
 /** Круг направленной сделки на одной бирже: вход и выход тейкером, % от номинала */
 export function directionalCostPct(ex: ExchangeId | null | undefined): number {
   return 2 * taker(ex) * 100;
+}
+
+/**
+ * Нетто-фандинг арбитражной позиции, % от номинала В ЧАС.
+ *
+ * Позиция маркет-нейтральна по цене, но не по фандингу: длинная нога платит свою
+ * ставку, короткая получает свою, и на удержании в несколько часов разность
+ * крупнее комиссий круга. Ставки приводятся к часу — интервалы у бирж разные
+ * (1ч/4ч/8ч), и складывать их как есть нельзя. Интервал неизвестен → берётся 8ч
+ * как самый распространённый; это допущение, и оно занижает вклад часовых ставок.
+ *
+ * Знак: результат — ИЗДЕРЖКА. Отрицательное значение значит, что карри платит в нашу
+ * сторону.
+ */
+export function fundingHourlyPctOf(
+  buy: { fundingRate: number | null; fundingIntervalMin: number | null } | null | undefined,
+  sell: { fundingRate: number | null; fundingIntervalMin: number | null } | null | undefined
+): number | null {
+  const perHour = (f: { fundingRate: number | null; fundingIntervalMin: number | null } | null | undefined) => {
+    if (!f || f.fundingRate == null) return null;
+    const mins = f.fundingIntervalMin && f.fundingIntervalMin > 0 ? f.fundingIntervalMin : 480;
+    return f.fundingRate * (60 / mins) * 100;
+  };
+  const b = perHour(buy);
+  const s = perHour(sell);
+  if (b == null || s == null) return null;
+  // длинная нога на buyEx платит b, короткая на sellEx получает s
+  return Math.round((b - s) * 10_000) / 10_000;
 }

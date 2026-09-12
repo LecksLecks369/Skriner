@@ -2,7 +2,7 @@ import { NextRequest } from 'next/server';
 import { BREAKOUT_ALERT, getScan } from '@/lib/screener/scan';
 import type { CoinRow } from '@/lib/screener/types';
 import { numParam } from '@/lib/screener/params';
-import { isPatternMuted } from '@/lib/screener/patterns';
+import { SPREAD_ALERT_MIN_Z, isPatternMuted } from '@/lib/screener/patterns';
 
 /* Авто-отключение: тип сигнала, у которого весь доверительный интервал матожидания лежит
    ниже нуля, в алерты не идёт — он доказанно не окупает издержки. Отключение молчаливым
@@ -63,10 +63,34 @@ export async function GET(req: NextRequest) {
               chop: isPatternMuted('chop'),
             };
             const alerts: Array<Record<string, unknown>> = [];
+            /* Сколько кандидатов не доехало до алерта из-за неизвестного стакана:
+               молчание по этой причине неотличимо от «разрывов нет», поэтому счётчик
+               уезжает в ping. */
+            let noBookCount = 0;
+            /* Кандидатов, снятых вторым затвором: разрыв исполним, но для этого
+               символа он не выходит за его собственную норму. */
+            let noBaselineCount = 0;
             for (const row of resp.rows as CoinRow[]) {
               const spread = row.netSpreadPct;
+              /* Триггер по ИСПОЛНИМОМУ спреду, а не по сырому. Сырой не вычитает
+                 слипейдж круга, и на живом скане он больше самого разрыва в разы
+                 (медиана разрыва 0.33% против слипейджа круга 1.03%): алерт по
+                 сырому зовёт в сделку, которую вторая модель этой же системы
+                 оценивает в −2.5% на сделку. Стакан неизвестен — вердикта нет,
+                 и это не повод выдать оптимистичный. */
+              const exec = row.netExecPct;
+              const bookKnown = exec != null;
+              const spreadCandidate = spread != null && spread >= init.thresholdPct;
+              if (!muted.spread && spreadCandidate && !bookKnown) noBookCount++;
+              /* Второй затвор — необычность разрыва для САМОГО символа. Разрыв
+                 0.3% на монете, где 0.3% это норма, — базовая линия, а не
+                 расхождение; в замере группа без истории (z отсутствует) —
+                 единственная с отрицательным матожиданием. Порог общий с тем, по
+                 которому «История» разбивает win-rate. */
+              const zOk = row.zScore != null && row.zScore >= SPREAD_ALERT_MIN_Z;
+              if (!muted.spread && spreadCandidate && bookKnown && exec > 0 && !zOk) noBaselineCount++;
               // выключенный спред снимает только спред-триггер: алерт по скору — другой сигнал
-              const isSpread = !muted.spread && spread != null && spread >= init.thresholdPct;
+              const isSpread = !muted.spread && spreadCandidate && bookKnown && exec > 0 && zOk;
               const isScore = init.minScore > 0 && row.score >= init.minScore;
               if (!isSpread && !isScore) continue;
               const last = lastSent.get(row.symbol) || 0;
@@ -78,6 +102,10 @@ export async function GET(req: NextRequest) {
               alerts.push({
                 symbol: row.symbol,
                 spreadPct: spread,
+                // исполнимый спред и слипейдж круга — то, по чему принято решение
+                netExecPct: row.netExecPct,
+                slipRoundTripPct: row.deep?.slipRoundTripPct ?? null,
+                slipBudgetUsd: row.deep?.slipBudgetUsd ?? null,
                 zScore: row.zScore,
                 score: row.score,
                 ageMin: row.spreadAgeMin,
@@ -175,6 +203,12 @@ export async function GET(req: NextRequest) {
               statuses: resp.statuses,
               // какие типы сигналов сейчас выключены по отрицательному эджу
               muted: Object.entries(muted).filter(([, v]) => v).map(([k]) => k),
+              /* Стадии, которые скан не успел: пустой поток алертов при
+                 пропущенном стакане — это «не измерено», а не «нет разрывов». */
+              skippedStages: resp.skippedStages ?? [],
+              spreadNoBook: noBookCount,
+              spreadNoBaseline: noBaselineCount,
+              spreadMinZ: SPREAD_ALERT_MIN_Z,
             });
           } catch {
             send('ping', { ts: Date.now(), error: 'scan-failed' });

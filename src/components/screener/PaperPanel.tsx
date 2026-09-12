@@ -1,10 +1,10 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CoinRow, PaperTrade, ScanResponse } from '@/lib/screener/types';
 import { EX_MAP } from './format';
 import { netSpreadForPair } from '@/lib/screener/pair';
-import { arbCostPct, arbPnlPct } from '@/lib/screener/costs';
+import { arbPnlPct, arbTotalCostPct } from '@/lib/screener/costs';
 import { Button } from '@/components/ui/button';
 import { toast } from '@/hooks/use-toast';
 
@@ -85,7 +85,11 @@ export function PaperPanel({ scan }: { scan: ScanResponse | null }) {
   const [trades, setTrades] = useState<PaperTrade[]>([]);
   const [stats, setStats] = useState<PaperStats | null>(null);
   const [analytics, setAnalytics] = useState<Analytics | null>(null);
-  const rowsRef = useRef<Map<string, CoinRow>>(new Map());
+  /* Карта строк выводится из scan через useMemo, а не копится в рефе. Реф
+     заполнялся эффектом, а таблица читала его В РЕНДЕРЕ: эффект выполняется
+     ПОСЛЕ рендера, поэтому колонка «сейчас» показывала предыдущий скан, а
+     мутация рефа ре-рендер не вызывает — при неизменном списке сделок цифра
+     могла не обновиться вовсе. */
   const closingRef = useRef<Set<string>>(new Set());
 
   const load = useCallback(() => {
@@ -125,16 +129,16 @@ export function PaperPanel({ scan }: { scan: ScanResponse | null }) {
   );
 
   /* TP/SL и таймаут считает сервер на каждом скане (lib/screener/paper.ts) — здесь
-     только обновляем карту строк для ручного закрытия. Раньше сопровождение жило в этом
+     только держим карту строк для ручного закрытия и живого P&L. Раньше сопровождение жило в
      эффекте, то есть работало лишь пока открыта вкладка; теперь дублировать его нельзя —
      два закрывающих контура по одним и тем же порогам просто гоняются за одной сделкой. */
-  useEffect(() => {
-    if (!scan) return;
-    rowsRef.current = new Map(scan.rows.map((r) => [r.symbol, r]));
-  }, [scan?.ts]);
+  const rows = useMemo(
+    () => new Map<string, CoinRow>((scan?.rows ?? []).map((r) => [r.symbol, r])),
+    [scan]
+  );
 
   const manualClose = async (t: PaperTrade) => {
-    const row = rowsRef.current.get(t.symbol);
+    const row = rows.get(t.symbol);
     const cur = row ? netSpreadForPair(row, t.buyEx, t.sellEx) : null;
     await close(t.id, cur ?? t.netEntry, 'manual');
   };
@@ -259,14 +263,27 @@ export function PaperPanel({ scan }: { scan: ScanResponse | null }) {
           </thead>
           <tbody>
             {trades.map((t) => {
-              const row = rowsRef.current.get(t.symbol);
+              const row = rows.get(t.symbol);
               const live = row ? netSpreadForPair(row, t.buyEx, t.sellEx) : null;
               const cur = t.status === 'open' ? live : t.netExit;
               const pnl =
                 t.status === 'closed'
                   ? t.pnlPct
                   : live != null
-                    ? arbPnlPct(t.netEntry, live, arbCostPct(t.buyEx, t.sellEx, t.slipRoundTripPct ?? null))
+                    ? arbPnlPct(
+                        t.netEntry,
+                        live,
+                        /* та же формула издержек, что у сервера при закрытии, вместе со
+                           стоимостью удержания: без неё цифра на экране расходится с
+                           журналом тем сильнее, чем дольше висит позиция */
+                        arbTotalCostPct(
+                          t.buyEx,
+                          t.sellEx,
+                          t.slipRoundTripPct ?? null,
+                          t.fundingHourlyPct,
+                          Date.now() - t.ts
+                        )
+                      )
                     : null;
               return (
                 <tr key={t.id} className="border-b border-zinc-900/70">

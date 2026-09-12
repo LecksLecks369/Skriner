@@ -45,7 +45,7 @@ export function Header({
         <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
           <div className="flex items-baseline gap-2">
             <h1 className="text-base font-bold tracking-tight text-zinc-50 sm:text-lg">
-              MetaScreener<span className="text-emerald-400">×</span>6
+              MetaScreener<span className="text-emerald-400">×</span>{EXCHANGES.length}
             </h1>
             <span className="hidden text-[11px] text-zinc-500 md:inline">
               межбиржевые неэффективности · фьючерсы USDT
