@@ -1,4 +1,5 @@
 import type { Candle, SweepSignal } from './types';
+import { execSpreadPct } from './costs';
 
 export function atr(candles: Candle[], period = 14): number | null {
   if (candles.length < period + 1) return null;
@@ -93,15 +94,16 @@ export interface ScoreInput {
 const SLIP_BUDGET_USD = 25_000;
 
 /**
- * Исполнимый спред: нетто минус проскальзывание обеих ног круга.
+ * Исполнимый спред: нетто минус проскальзывание ПОЛНОГО круга (двух пересечений книг).
  * null, если проскальзывание неизвестно — в том числе когда стакан измерялся,
  * но не смог набрать нужный объём. Возвращать здесь сырой нетто нельзя:
  * это давало бы самым тонким книгам вид самых исполнимых.
+ *
+ * Выражение живёт в costs.ts и здесь только реэкспортируется: пока их было два —
+ * скаляр строки вычитал слипейдж один раз, лестница размеров два, — оба поля
+ * назывались netExecPct и расходились в одном и том же объекте.
  */
-export function execSpreadPct(netSpreadPct: number | null, slipRoundTripPct: number | null | undefined): number | null {
-  if (netSpreadPct == null || slipRoundTripPct == null) return null;
-  return Math.max(0, netSpreadPct - slipRoundTripPct);
-}
+export { execSpreadPct } from './costs';
 
 /**
  * Поправка на размер: спред на $2k книги и спред на $25k книги — разные вещи.
@@ -167,7 +169,11 @@ export function computeScore(inp: ScoreInput): ScoreResult {
     // стакан запрашивался: null означает, что книга не набрала объём даже на
     // минимальный бюджет — спред неисполним, баллов за него нет
     const netExec = execSpreadPct(inp.netSpreadPct, inp.slipRoundTripPct);
-    if (netExec != null) multi += Math.min(10, (netExec / 0.6) * 10) * sizeViability(inp.maxPosUsd);
+    /* Обрезка снизу нулём здесь, а не в самом выражении: неисполнимый спред не даёт
+       баллов, но и не отнимает их у других слагаемых скора. В самой величине обрезки
+       быть не должно — там она уничтожала различие между «чуть-чуть не окупается» и
+       «круг дороже разрыва втрое». */
+    if (netExec != null) multi += Math.min(10, (Math.max(0, netExec) / 0.6) * 10) * sizeViability(inp.maxPosUsd);
   }
   if (inp.zScore != null && inp.zScore > 0) multi += Math.min(6, (inp.zScore / 3) * 6);
   multi += Math.min(4, Math.max(0, (inp.coverage - 1) * 1.3)); // 2 биржи=1.3, 4 биржи=3.9

@@ -28,8 +28,8 @@ export interface EdgeReport {
   n: number; // сколько исходов вошло в оценку (окно)
   nTotal: number; // сколько разрешённых исходов есть всего
   /* Сколько среди них НЕЗАВИСИМЫХ единиц (разных символов): n считает строки,
-     а строки одного символа — повторные замеры одного события. Пусто там, где
-     единицы не переданы. */
+     а строки одного символа — повторные замеры одного события. null = единицы не
+     переданы, интервал построен по строкам и потому оптимистичен. */
   nUnits: number | null;
   expectancyPct: number | null; // среднее чистое P&L на сделку, %
   ciLoPct: number | null; // 95% доверительный интервал матожидания
@@ -131,6 +131,58 @@ export function bootstrapMeanCI(xs: number[], level = 0.95, groups?: string[]): 
   return { lo, hi };
 }
 
+/**
+ * Кластерный интервал для ДОЛИ: ресэмплятся символы целиком, а не строки.
+ *
+ * Зачем отдельно от wilsonInterval. Уилсон предполагает независимые испытания
+ * Бернулли. У детектора, который срабатывает на одном символе несколько раз внутри
+ * горизонта оценки, строки одного символа — повторные замеры одного события, и
+ * интервал сужается ровно в меру дублирования. Для матожидания это уже было учтено
+ * (bootstrapMeanCI с группами), а для детекторов, у которых исход — попадание, а не
+ * P&L, — нет: их затвор стоял на построчном Уилсоне. Разные единицы измерения не
+ * освобождают от одного и того же требования к независимости наблюдений.
+ *
+ * Групп меньше двух — возвращается null, и вызывающий честнее откатится на Уилсона,
+ * чем построит интервал по одной единице.
+ */
+export function bootstrapRateCI(
+  hits: boolean[],
+  groups: string[],
+  level = 0.95
+): { lo: number; hi: number } | null {
+  const n = hits.length;
+  if (n < 2 || groups.length !== n) return null;
+  const by = new Map<string, boolean[]>();
+  for (let i = 0; i < n; i++) {
+    const cur = by.get(groups[i]);
+    if (cur) cur.push(hits[i]);
+    else by.set(groups[i], [hits[i]]);
+  }
+  if (by.size < 2) return null;
+  const clusters = [...by.values()];
+  const K = clusters.length;
+  const rand = rng(seedOf(hits.map((h) => (h ? 1 : 0))));
+  const rates = new Array<number>(BOOTSTRAP_B);
+  for (let b = 0; b < BOOTSTRAP_B; b++) {
+    let hit = 0;
+    let cnt = 0;
+    for (let i = 0; i < K; i++) {
+      const c = clusters[(rand() * K) | 0];
+      for (const v of c) {
+        if (v) hit++;
+        cnt++;
+      }
+    }
+    rates[b] = cnt ? hit / cnt : 0;
+  }
+  rates.sort((a, b) => a - b);
+  const alpha = (1 - level) / 2;
+  return {
+    lo: rates[Math.floor(alpha * BOOTSTRAP_B)],
+    hi: rates[Math.min(BOOTSTRAP_B - 1, Math.ceil((1 - alpha) * BOOTSTRAP_B) - 1)],
+  };
+}
+
 /** Интервал Уилсона для доли: на малых n честнее нормального приближения */
 export function wilsonInterval(wins: number, n: number, z = 1.96): { lo: number; hi: number } | null {
   if (n <= 0) return null;
@@ -172,17 +224,21 @@ export function wilsonInterval(wins: number, n: number, z = 1.96): { lo: number;
  *   базовая внутри интервала           → 'inconclusive'.
  *
  * hits — исходы В ХРОНОЛОГИЧЕСКОМ ПОРЯДКЕ; окно то же, что у computeEdge.
+ * groups — символ каждого исхода: независимая единица наблюдения. Передан — интервал
+ * строится ресэмплингом символов, как у матожидания; не передан или единиц меньше
+ * двух — откат на Уилсона по строкам, и это отражается в nUnits (null).
  */
-export function computeRateEdge(hits: boolean[], baseRate: number): EdgeReport {
+export function computeRateEdge(hits: boolean[], baseRate: number, groups?: string[]): EdgeReport {
   const nTotal = hits.length;
   const win = hits.slice(-EDGE_WINDOW);
   const n = win.length;
+  const winGroups = groups && groups.length === nTotal ? groups.slice(-EDGE_WINDOW) : undefined;
   const pct = (v: number) => Math.round(v * 1000) / 1000;
   const basePct = Math.round(baseRate * 1000) / 10;
   const out: EdgeReport = {
     n,
     nTotal,
-    nUnits: null, // попадание/промах: единица наблюдения сюда не передаётся
+    nUnits: winGroups ? new Set(winGroups).size : null,
     expectancyPct: null, // не определено: сделки нет
     ciLoPct: null,
     ciHiPct: null,
@@ -198,25 +254,29 @@ export function computeRateEdge(hits: boolean[], baseRate: number): EdgeReport {
   if (!n) return out;
 
   const wins = win.filter(Boolean).length;
-  const wr = wilsonInterval(wins, n);
+  /* Кластерный интервал, когда единицы известны; иначе построчный Уилсон. Порядок
+     важен: построчный интервал уже истинного, а затвор открывается и закрывается
+     именно по его границам. */
+  const wr = (winGroups ? bootstrapRateCI(win, winGroups) : null) ?? wilsonInterval(wins, n);
   out.winRate = pct(wins / n);
   out.winLoPct = wr ? pct(wr.lo) : null;
   out.winHiPct = wr ? pct(wr.hi) : null;
 
+  const rUnits = out.nUnits != null && out.nUnits < n ? `, независимых символов ${out.nUnits}` : '';
   if (n < EDGE_MIN_N) return out;
   if (wr && wr.hi < baseRate) {
     out.verdict = 'negative';
     out.muted = true;
-    out.reason = `${Math.round((wins / n) * 100)}% попаданий (интервал до ${Math.round(wr.hi * 100)}%, n=${n}) — ниже базовой частоты ${basePct}%: сигнал хуже её отсутствия`;
+    out.reason = `${Math.round((wins / n) * 100)}% попаданий (интервал до ${Math.round(wr.hi * 100)}%, n=${n}${rUnits}) — ниже базовой частоты ${basePct}%: сигнал хуже её отсутствия`;
     return out;
   }
   if (wr && wr.lo > baseRate) {
     out.verdict = 'positive';
-    out.reason = `${Math.round((wins / n) * 100)}% попаданий (интервал от ${Math.round(wr.lo * 100)}%, n=${n}) — выше базовой частоты ${basePct}%`;
+    out.reason = `${Math.round((wins / n) * 100)}% попаданий (интервал от ${Math.round(wr.lo * 100)}%, n=${n}${rUnits}) — выше базовой частоты ${basePct}%`;
     return out;
   }
   out.reason = wr
-    ? `${Math.round((wins / n) * 100)}% попаданий, интервал [${Math.round(wr.lo * 100)}%; ${Math.round(wr.hi * 100)}%] накрывает базовую частоту ${basePct}% при n=${n} — эдж не доказан`
+    ? `${Math.round((wins / n) * 100)}% попаданий, интервал [${Math.round(wr.lo * 100)}%; ${Math.round(wr.hi * 100)}%] накрывает базовую частоту ${basePct}% при n=${n}${rUnits} — эдж не доказан`
     : `n=${n}`;
   out.verdict = 'inconclusive';
   return out;

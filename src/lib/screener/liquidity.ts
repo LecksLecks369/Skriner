@@ -5,6 +5,7 @@
 import type { Book, TapeTrade } from './exchanges';
 import { EXCHANGES, type Candle, type ExchangeId, type ExDepth, type LiquidityDeep, type TapeStats } from './types';
 import { computeMm } from './mm';
+import { execSpreadPct } from './costs';
 
 const MAKER_FEE = Object.fromEntries(EXCHANGES.map((e) => [e.id, e.makerFee])) as Record<ExchangeId, number>;
 
@@ -402,7 +403,8 @@ export function assembleDeep(inp: DeepInput): LiquidityDeep {
      выбранный объём, а не про сигнал. Замер независимым опросом стаканов: на
      IOSTUSDT разрыв 0.765% валовый давал +0.48% на $1k, +0.27% на $5k и не
      набирался вовсе на $25k. Круг — ДВА пересечения книг (вход и выход), поэтому
-     из спреда вычитается 2×slipRoundTrip. */
+     из спреда вычитается 2×slipRoundTrip — но не здесь: выражение одно и живёт в
+     costs.ts. Пока копий было две, вторая (скаляр строки) вычитала один раз. */
   const arbSizeLadder: Array<{ usd: number; slipRoundTripPct: number; netExecPct: number }> = [];
   let arbMaxSizeUsd: number | null = null;
   if (inp.netSpreadPct != null) {
@@ -411,7 +413,8 @@ export function assembleDeep(inp: DeepInput): LiquidityDeep {
       const x = inp.exitEx ? inp.depths[inp.exitEx]?.[key] ?? null : null;
       if (e == null || x == null) continue;
       const rt = Math.round((e + x) * 1000) / 1000;
-      const net = Math.round((inp.netSpreadPct - 2 * rt) * 1000) / 1000;
+      const net = execSpreadPct(inp.netSpreadPct, rt);
+      if (net == null) continue;
       arbSizeLadder.push({ usd, slipRoundTripPct: rt, netExecPct: net });
       if (net > 0 && (arbMaxSizeUsd == null || usd > arbMaxSizeUsd)) arbMaxSizeUsd = usd;
     }

@@ -15,7 +15,12 @@ export async function GET() {
   const trades = load().slice().reverse(); // новые сверху
   const open = trades.filter((t) => t.status === 'open');
   const closed = trades.filter((t) => t.status === 'closed');
-  const wins = closed.filter((t) => (t.pnlPct ?? 0) > 0.005).length;
+  /* Победа — ровно то же условие, что в edge.ts: pnlPct > 0. Раньше здесь стоял
+     порог 0.005%, и в одном ответе ехали два разных определения победы, одно в
+     stats.winRate, другое в analytics.edge.winRate. Сделки без pnlPct — отсутствие
+     данных, а не ноль: они не попадают ни в числитель, ни в знаменатель. */
+  const closedWithPnl = closed.filter((t) => t.pnlPct != null);
+  const wins = closedWithPnl.filter((t) => t.pnlPct! > 0).length;
 
   /* -------- P&L-аналитика: реальное матожидание стратегии -------- */
   const closedSorted = closed.filter((t) => t.pnlPct != null).sort((a, b) => (a.closedTs ?? a.ts) - (b.closedTs ?? b.ts));
@@ -61,7 +66,11 @@ export async function GET() {
   const unmodeled = closedSorted.filter((t) => !t.slipModeled).length;
   /* Матожидание с доверительным интервалом: без интервала средний P&L на десятке сделок
      читается как факт. Вердикт тот же, что у паттернов, — по положению нуля в интервале. */
-  const edge = computeEdge(pnls);
+  /* Символ каждой сделки — независимая единица наблюдения. Без него интервал
+     ресэмплит строки, а строки одного символа коррелированы: в окне оценки 60
+     сделок пришли с 24 символов, и один давал 10 из них. Кластерный бутстрэп был
+     заведён в edge.ts ровно для этого, но подключён только на стороне паттернов. */
+  const edge = computeEdge(pnls, closedSorted.map((t) => t.symbol));
   const analytics = {
     edge,
     slipUnmodeled: unmodeled,
@@ -91,10 +100,14 @@ export async function GET() {
     stats: {
       open: open.length,
       closed: closed.length,
+      /* Знаменатель — сделки С результатом, а не все закрытые: закрытая сделка без
+         pnlPct не «нулевая», она неизмеренная, и деление на неё разбавляло и
+         win-rate, и среднее, расходясь с analytics.expectancy на той же выборке. */
+      closedWithPnl: closedWithPnl.length,
       wins,
-      winRate: closed.length ? wins / closed.length : null,
-      avgPnl: closed.length ? closed.reduce((s, t) => s + (t.pnlPct ?? 0), 0) / closed.length : null,
-      totalPnl: closed.reduce((s, t) => s + (t.pnlPct ?? 0), 0),
+      winRate: closedWithPnl.length ? wins / closedWithPnl.length : null,
+      avgPnl: closedWithPnl.length ? closedWithPnl.reduce((s, t) => s + t.pnlPct!, 0) / closedWithPnl.length : null,
+      totalPnl: closedWithPnl.reduce((s, t) => s + t.pnlPct!, 0),
     },
     analytics,
   });

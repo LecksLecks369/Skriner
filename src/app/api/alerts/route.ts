@@ -2,7 +2,7 @@ import { NextRequest } from 'next/server';
 import { BREAKOUT_ALERT, getScan } from '@/lib/screener/scan';
 import type { CoinRow } from '@/lib/screener/types';
 import { numParam } from '@/lib/screener/params';
-import { SPREAD_ALERT_MIN_Z, isPatternMuted } from '@/lib/screener/patterns';
+import { COOLDOWN_MS, SPREAD_ALERT_MIN_Z, isPatternMuted } from '@/lib/screener/patterns';
 
 /* Авто-отключение: тип сигнала, у которого весь доверительный интервал матожидания лежит
    ниже нуля, в алерты не идёт — он доказанно не окупает издержки. Отключение молчаливым
@@ -41,10 +41,16 @@ export async function GET(req: NextRequest) {
         }
       };
 
-      let lastSent = new Map<string, number>(); // symbol -> ts последнего алерта (cooldown 90с)
-      let robotSent = new Map<string, number>(); // отдельный кулдаун паттерна «робот вошёл» — 10 мин
-      const breakoutSent = new Map<string, number>(); // готовность к пробою — 15 мин
-      const distSent = new Map<string, number>(); // раздача/набор — 20 мин
+      /* Кулдауны берутся из COOLDOWN_MS — той же таблицы, по которой сигнал
+         пишется в историю. Своих чисел здесь быть не может: карточка каждого типа
+         подписана alertScope, и 'same' — это утверждение, что популяция алертов и
+         популяция записей совпадают. Пока числа стояли отдельно (90с/10/15/20 мин
+         против 30 у записи), утверждение было ложным для robot, breakout и
+         distribution, а win-rate на карточке относился к более редкой выборке. */
+      let lastSent = new Map<string, number>(); // symbol -> ts последнего спред-алерта
+      let robotSent = new Map<string, number>();
+      const breakoutSent = new Map<string, number>();
+      const distSent = new Map<string, number>();
       let running = true;
 
       const tick = async () => {
@@ -73,11 +79,16 @@ export async function GET(req: NextRequest) {
             for (const row of resp.rows as CoinRow[]) {
               const spread = row.netSpreadPct;
               /* Триггер по ИСПОЛНИМОМУ спреду, а не по сырому. Сырой не вычитает
-                 слипейдж круга, и на живом скане он больше самого разрыва в разы
-                 (медиана разрыва 0.33% против слипейджа круга 1.03%): алерт по
-                 сырому зовёт в сделку, которую вторая модель этой же системы
-                 оценивает в −2.5% на сделку. Стакан неизвестен — вердикта нет,
-                 и это не повод выдать оптимистичный. */
+                 слипейдж круга, и на живом скане круг дороже разрыва почти всегда:
+                 медиана slipRoundTripPct 0.519% — то есть 1.04% на круг — против
+                 медианы нетто-разрыва −0.06%. Алерт по сырому зовёт в сделку,
+                 которую вторая модель этой же системы оценивает в −2.34% на сделку
+                 (148 закрытых бумажных сделок). Стакан неизвестен — вердикта нет,
+                 и это не повод выдать оптимистичный.
+
+                 netExecPct больше не обрезается снизу нулём: обрезка делала 32
+                 строки из 33 равными ровно 0.000 и прятала расхождение с лестницей
+                 размеров, которая всегда считала круг как два пересечения книг. */
               const exec = row.netExecPct;
               const bookKnown = exec != null;
               const spreadCandidate = spread != null && spread >= init.thresholdPct;
@@ -94,11 +105,13 @@ export async function GET(req: NextRequest) {
               const isScore = init.minScore > 0 && row.score >= init.minScore;
               if (!isSpread && !isScore) continue;
               const last = lastSent.get(row.symbol) || 0;
-              if (now - last < 90_000) continue; // серверный cooldown
-              // рост разрыва — пробиваем cooldown
-              const grew = spread != null && row.spreadSpark && row.spreadSpark.length > 2 &&
-                spread >= (row.spreadSpark[row.spreadSpark.length - 3] || 0) * 1.3;
-              if (!grew) lastSent.set(row.symbol, now);
+              /* Кулдаун спреда — тот же, что и у записи в историю. Прежняя ветка
+                 «разрыв вырос — пробиваем кулдаун» снята: повторная сработка внутри
+                 горизонта оценки это продолжение открытого сигнала, а не новое
+                 наблюдение, и именно на затянувшихся разрывах (то есть на
+                 контрпримерах к тезису паттерна) она давала больше всего копий. */
+              if (now - last < COOLDOWN_MS.spread) continue;
+              lastSent.set(row.symbol, now);
               alerts.push({
                 symbol: row.symbol,
                 spreadPct: spread,
@@ -118,20 +131,32 @@ export async function GET(req: NextRequest) {
             }
             if (alerts.length) send('alert', { alerts, ts: now });
 
-            // Паттерн «🤖 робот вошёл в неликвид»: алго-скор ≥55 + неликвид ≥50 + спред
+            /* Паттерн «🤖 робот вошёл в неликвид». Условие живёт в liquidity.ts
+               (ROBOT_ALGO_MIN / ROBOT_ILLIQ_MIN + непустая лента); межбиржевого
+               разрыва в воротах нет с тех пор, как замер показал, что спред и
+               алго-активность на полосе неликвида не совпадают. Числа здесь не
+               дублируются: подпись, набранная отдельно от константы, расходится
+               с ней молча и ровно тогда, когда порог двигают. */
             const robotAlerts: Array<Record<string, unknown>> = [];
             for (const row of resp.rows as CoinRow[]) {
               if (muted.robot) break;
               const d = row.deep;
               if (!d?.pattern?.robotIlliquid) continue;
               const last = robotSent.get(row.symbol) || 0;
-              if (now - last < 10 * 60_000) continue;
+              if (now - last < COOLDOWN_MS.robot) continue;
               robotSent.set(row.symbol, now);
               robotAlerts.push({
                 symbol: row.symbol,
                 algoScore: d.algoScore,
                 illiqScore: d.illiqScore,
                 netSpreadPct: row.netSpreadPct,
+                /* Исполнимый спред рядом с сырым. Робот — предупреждение о структуре
+                   книги, а не предложение арбитража, но алерт печатает маршрут
+                   (вход → выход, max-позиция) и нетто-спред, и без исполнимого рядом
+                   это читается как сделка. Замер на живом скане: у сработавшего
+                   символа нетто было −0.16% при слипейдже $25k в 1.07% — маршрут,
+                   убыточный ещё до издержек круга. null = стакан не измерен. */
+                netExecPct: row.netExecPct,
                 slip25kPct: d.slip25kPct,
                 maxPosUsd: d.maxPosUsd,
                 entryEx: d.entryEx,
@@ -158,7 +183,7 @@ export async function GET(req: NextRequest) {
             for (const row of resp.rows as CoinRow[]) {
               const b = row.breakout;
               if (b && !muted.breakout && b.ready && b.score >= BREAKOUT_ALERT) {
-                if (now - (breakoutSent.get(row.symbol) || 0) >= 15 * 60_000) {
+                if (now - (breakoutSent.get(row.symbol) || 0) >= COOLDOWN_MS.breakout) {
                   breakoutSent.set(row.symbol, now);
                   setupAlerts.push({
                     kind: 'breakout',
@@ -180,7 +205,7 @@ export async function GET(req: NextRequest) {
               }
               const d = row.dist;
               if (d && d.dir && !muted.distribution) {
-                if (now - (distSent.get(row.symbol) || 0) >= 20 * 60_000) {
+                if (now - (distSent.get(row.symbol) || 0) >= COOLDOWN_MS.distribution) {
                   distSent.set(row.symbol, now);
                   setupAlerts.push({
                     kind: 'distribution',

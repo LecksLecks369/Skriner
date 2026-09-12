@@ -1,19 +1,34 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { loadSnapshotLines } from '@/lib/screener/store';
 import { numParam } from '@/lib/screener/params';
+import { simulateArb } from '@/lib/screener/arbsim';
+import { HORIZON_MS } from '@/lib/screener/patterns';
+import type { ExchangeId } from '@/lib/screener/types';
 
 export const dynamic = 'force-dynamic';
 
-/* Оптимизатор фильтров: перебор сетки порогов (нетто ≥ / скор ≥ / кулдаун) по снапшотам скана.
-   В отличие от бэктеста (win = сошёлся вдвое), здесь эмулируется сделка с правилами paper-трейдинга:
-   TP — нетто сжалось до max(0.05%, 35% входа); SL — нетто выросло на 0.25%; таймаут 30м — выход по текущему.
-   PnL сделки = netEntry − netExit (% на круг). Итог: топ-комбинации по матожиданию с учётом значимости. */
+/* Оптимизатор фильтров: перебор сетки порогов по снимкам скана.
+
+   Сделка проводится ОДНИМ выражением с бэктестом и с историей паттернов —
+   simulateArb поверх costs.ts. Раньше P&L считался здесь как netEntry - netExit:
+   комиссии в этой разности сокращаются (обе величины уже нетто одного пересечения),
+   а слипейджа нет вовсе, то есть круг выходил бесплатным. Следствие видно прямо в
+   выдаче: сетка всегда выбирала самый мягкий порог — на живом замере 0.15 / скор 0 /
+   кулдаун 5 мин, 323 сделки в сутки по +0.136%, при том что симулятор с полными
+   издержками на том же типе сделки давал -2.34% на сделку по 148 закрытым позициям.
+
+   Доля сделок, посчитанных без слипейджа, возвращается отдельным полем: это
+   допущение, а не измерение, и складывать его в заголовочную цифру нельзя. */
 
 const THRESHOLDS = [0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5, 0.6];
 const SCORES = [0, 15, 25, 35, 50, 60];
-const COOLDOWNS = [5, 10, 20];
-const SL_ADD = 0.25; // % — насколько разрыв должен вырасти против нас
-const WINDOW_MS = 30 * 60 * 1000;
+/* Кулдаун короче горизонта оценки превращает один затянувшийся разрыв в несколько
+   сделок с перекрывающимися окнами: n растёт, независимых наблюдений не прибавляется,
+   а ранжирование по avgPnl x sqrt(decided) вознаграждает ровно это дублирование.
+   Поэтому сетка начинается с самого горизонта, а не с 5 минут. */
+const HORIZON_MIN = Math.round(HORIZON_MS / 60_000);
+const COOLDOWNS = [HORIZON_MIN, HORIZON_MIN * 2, HORIZON_MIN * 4];
+const WINDOW_MS = HORIZON_MS;
 
 interface ComboResult {
   threshold: number;
@@ -25,12 +40,16 @@ interface ComboResult {
   sls: number; // SL (включая таймауты с минусом)
   timeouts: number;
   winRate: number | null;
-  totalPnl: number; // суммарный % на круг по всем сделкам
-  avgPnl: number | null; // матожидание одной сделки, %
+  totalPnl: number; // суммарный % на круг по всем сделкам, ПОСЛЕ издержек
+  avgPnl: number | null; // матожидание одной сделки, %, ПОСЛЕ издержек
   avgWin: number | null;
   avgLoss: number | null;
   maxDdPct: number; // макс просадка кривой суммарного PnL, п.п.
   tradesPerDay: number;
+  /* Сколько решённых сделок посчитано без слипейджа (стакан не измерен либо снимок
+     старше поля). На эту долю результат завышен, и завышен в разы: слипейдж круга на
+     живом скане порядка 1% против 0.18% комиссий. */
+  noSlip: number;
 }
 
 interface CacheGlobal {
@@ -51,51 +70,44 @@ function runCombo(
   const lastFire = new Map<string, number>();
   interface Open {
     ts: number;
+    symbol: string;
     entry: number;
-    tp: number;
-    sl: number;
-    done: boolean;
+    hi: ExchangeId;
+    lo: ExchangeId;
+    slip: number | null;
+    path: Array<{ ts: number; net: number }>;
   }
-  const open = new Map<string, Open[]>();
-  let wins = 0, sls = 0, timeouts = 0, decided = 0, signals = 0;
+  const open: Open[] = [];
+  let wins = 0, sls = 0, timeouts = 0, decided = 0, signals = 0, noSlip = 0;
   let totalPnl = 0, sumWin = 0, sumLoss = 0, peak = 0, maxDd = 0;
 
-  const settle = (pnl: number, kind: 'tp' | 'sl' | 'timeout') => {
-    totalPnl += pnl;
-    if (pnl >= 0) wins++; else sls++;
-    if (kind === 'timeout') timeouts++;
+  const close = (o: Open) => {
+    const res = simulateArb(o.entry, o.path, o.hi, o.lo, o.slip);
+    if (!res) return; // пути нет — это отсутствие данных, а не нулевой исход
+    totalPnl += res.pnlPct;
+    if (res.win) wins++; else sls++;
+    if (res.exit === 'timeout') timeouts++;
+    if (!res.slipModeled) noSlip++;
     decided++;
-    sumWin += pnl > 0 ? pnl : 0;
-    sumLoss += pnl < 0 ? -pnl : 0;
+    sumWin += res.pnlPct > 0 ? res.pnlPct : 0;
+    sumLoss += res.pnlPct < 0 ? -res.pnlPct : 0;
     peak = Math.max(peak, totalPnl);
     maxDd = Math.max(maxDd, peak - totalPnl);
   };
 
   for (const line of lines) {
     if (!Array.isArray(line?.pts)) continue; // битая строка снапшота не должна ронять прогон
-    // 1) закрытие открытых сделок по текущим ценам
-    for (const [sym, arr] of open) {
-      const cur = line.pts.find((p) => p.s === sym);
-      const netNow = cur ? cur.net : null;
-      for (const o of arr) {
-        if (o.done) continue;
-        if (line.ts - o.ts > WINDOW_MS) {
-          const exit = netNow != null ? netNow : o.entry; // монета пропала со скана — по входу
-          settle(o.entry - exit, 'timeout');
-          o.done = true;
-          continue;
-        }
-        if (netNow == null) continue;
-        if (netNow <= o.tp) {
-          settle(o.entry - netNow, 'tp'); // выход по фактическому сжатию
-          o.done = true;
-        } else if (netNow >= o.sl) {
-          settle(o.entry - netNow, 'sl');
-          o.done = true;
-        }
+    const bySymbol = new Map(line.pts.map((p) => [p.s, p]));
+
+    // 1) ведём открытые сделки по текущим котировкам
+    for (let i = open.length - 1; i >= 0; i--) {
+      const o = open[i];
+      const cur = bySymbol.get(o.symbol);
+      if (cur) o.path.push({ ts: line.ts, net: cur.net });
+      if (line.ts - o.ts > WINDOW_MS) {
+        close(o);
+        open.splice(i, 1);
       }
-      open.set(sym, arr.filter((o) => !o.done));
-      if (!open.get(sym)!.length) open.delete(sym);
     }
 
     // 2) входы по фильтрам
@@ -105,11 +117,18 @@ function runCombo(
       if (line.ts - last < cooldownMin * 60_000) continue;
       lastFire.set(p.s, line.ts);
       signals++;
-      const arr = open.get(p.s) || [];
-      if (arr.length < 3) {
-        arr.push({ ts: line.ts, entry: p.net, tp: Math.max(0.05, p.net * 0.35), sl: p.net + SL_ADD, done: false });
-        open.set(p.s, arr);
-      }
+      /* Одна открытая позиция на символ. Прежний лимит в три штуки поверх кулдауна
+         означал, что кулдаун не ограничивал перекрытие окон вообще. */
+      if (open.some((o) => o.symbol === p.s)) continue;
+      open.push({
+        ts: line.ts,
+        symbol: p.s,
+        entry: p.net,
+        hi: p.hi,
+        lo: p.lo,
+        slip: typeof p.slip === 'number' ? p.slip : null,
+        path: [],
+      });
     }
   }
   // незакрытые на конце истории — не считаются (не decided)
@@ -130,6 +149,7 @@ function runCombo(
     avgLoss: sls ? Number((-sumLoss / sls).toFixed(3)) : null,
     maxDdPct: Number(maxDd.toFixed(2)),
     tradesPerDay: Number(((decided * 24) / Math.max(1, hours)).toFixed(1)),
+    noSlip,
   };
 }
 
@@ -139,7 +159,7 @@ export async function GET(req: NextRequest) {
   const minDecided = numParam(sp, 'minDecided', 8, 3);
   const curThreshold = numParam(sp, 'threshold', 0.25, 0.05);
   const curScore = numParam(sp, 'minScore', 0, 0);
-  const curCooldown = numParam(sp, 'cooldownMin', 10, 1);
+  const curCooldown = numParam(sp, 'cooldownMin', HORIZON_MIN, 1);
 
   // читаем кэш на каждом запросе: значение globalThis меняется, ссылка времени импорта — нет
   const cached = g.__optimizeCache;
@@ -183,7 +203,7 @@ export async function GET(req: NextRequest) {
 
   const nearTh = THRESHOLDS.reduce((p, c) => (Math.abs(c - curThreshold) < Math.abs(p - curThreshold) ? c : p), THRESHOLDS[0]);
   const nearSc = SCORES.includes(curScore) ? curScore : 0;
-  const nearCd = COOLDOWNS.includes(curCooldown) ? curCooldown : 10;
+  const nearCd = COOLDOWNS.includes(curCooldown) ? curCooldown : COOLDOWNS[0];
   const current = results.find((r) => r.threshold === nearTh && r.minScore === nearSc && r.cooldownMin === nearCd) ?? null;
 
   const resp = {

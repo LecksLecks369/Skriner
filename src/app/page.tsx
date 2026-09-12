@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { EXCHANGES, type CoinRow } from '@/lib/screener/types';
 import { useScreener } from '@/components/screener/useScreener';
 import { Header } from '@/components/screener/Header';
@@ -69,6 +70,7 @@ function exportCsv(rows: CoinRow[]) {
 }
 
 export default function Home() {
+  const router = useRouter();
   const s = useScreener();
   // храним символ + снимок строки: сама строка берётся из свежего скана, чтобы модалка
   // не замерзала на данных момента открытия; снимок — фолбэк, если монета вышла из топа
@@ -96,9 +98,11 @@ export default function Home() {
         e.preventDefault();
         (document.querySelector('input[placeholder^="Поиск"]') as HTMLInputElement | null)?.focus();
       } else if (e.key === 'r' && !e.metaKey && !e.ctrlKey) {
-        window.location.href = '/radar';
+        // router.push вместо window.location: полная перезагрузка сбрасывала
+        // открытый SSE-стрим алертов и прогретое состояние скана
+        router.push('/radar');
       } else if (e.key === 'l' && !e.metaKey && !e.ctrlKey) {
-        window.location.href = '/liquidity';
+        router.push('/liquidity');
       } else if (e.key === 'j') {
         e.preventDefault();
         const rows = filteredRef.current;
@@ -117,7 +121,7 @@ export default function Home() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, []);
+  }, [router]);
 
   const stats = useMemo(() => {
     const rows = s.scan?.rows || [];

@@ -138,7 +138,11 @@ export interface CoinRow {
   crossSpreadPct: number | null; // (max-min)/mid * 100
   refSpreadPct: number | null; // спред vs эталонной биржи
   netSpreadPct: number | null; // кросс-спред минус taker-комиссии обеих сторон
-  netExecPct: number | null; // исполнимый спред: netSpreadPct минус проскальзывание обеих ног (только там, где есть deep)
+  /* Исполнимый спред: netSpreadPct минус слипейдж ПОЛНОГО круга (2×slipRoundTripPct —
+     вход и выход это два пересечения книг). Считается одним выражением из costs.ts,
+     тем же, что и лестница размеров. Отрицательное значение осмысленно: круг дороже
+     разрыва. null = стакана нет, вердикта нет. */
+  netExecPct: number | null;
   quoteBased: boolean; // спред построен по bid/ask минимум двух бирж; false = котировок не хватило, спреда нет
   zScore: number | null; // аномальность спреда против своей истории
   spreadAgeMin: number | null; // сколько минут спред ≥ порога
@@ -243,7 +247,11 @@ export interface LiquidityDeep {
   entryEx: ExchangeId | null; // где купить дешевле (bestAsk)
   exitEx: ExchangeId | null; // где продать дороже (bestBid)
   slip25kPct: number | null; // худший слипейдж $25k среди entry/exit
-  slipRoundTripPct: number | null; // слипейдж обеих ног круга: вход + выход, %
+  /* Слипейдж ОДНОГО пересечения обеих книг (нога входа + нога выхода этого
+     пересечения), %. Круг состоит из ДВУХ таких пересечений, поэтому всюду, где
+     считается стоимость круга, это значение умножается на 2 — см. arbCostPct и
+     execSpreadPct в costs.ts. Имя историческое и шире, чем величина. */
+  slipRoundTripPct: number | null;
   slipBudgetUsd: number | null; // на каком объёме измерен slipRoundTripPct (верхняя доступная ступень лестницы)
   /* Наибольший размер из лестницы, на котором круг ещё окупается:
      netSpread − 2×слипейдж круга > 0. null — не окупается нигде, даже на $1k. */

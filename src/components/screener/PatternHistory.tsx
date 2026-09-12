@@ -210,12 +210,31 @@ export function PatternHistory() {
                   );
                 })()}
               </div>
+              {/* Крупная цифра — win-rate ЗА ВСЮ историю, а вердикт рядом и блок эджа
+                  ниже стоят на окне последних исходов. Это разные популяции, и пока обе
+                  были подписаны одними словами «на сделку» / «%», карточка показывала
+                  два win-rate и два матожидания, различающиеся на десяток пунктов,
+                  как если бы это была одна величина. Подпись теперь называет окно. */}
               <div className={`mt-2 font-mono text-2xl tabular-nums ${winRateColor(st.winRate)}`}>
                 {st.winRate != null ? `${Math.round(st.winRate * 100)}%` : '—'}
               </div>
               <div className="text-[10px] text-zinc-600">
-                в плюс из решённых: {st.wins} из {st.wins + st.losses}
+                за всю историю: {st.wins} из {st.wins + st.losses} решённых
               </div>
+              {/* Доля неоценённых — часть определения популяции, а не служебная
+                  статистика: если исход чаще не вычисляется, чем вычисляется, цифра
+                  выше описывает выборку, которую отобрала доступность данных. */}
+              {st.total > 0 && (
+                <div
+                  className={`text-[10px] ${
+                    st.expired > st.resolved ? 'text-amber-500/80' : 'text-zinc-600'
+                  }`}
+                  title="Истёкшие — сигналы, для которых исход посчитать было нечем: окно ушло за пределы доступной истории цен"
+                >
+                  {st.expired > st.resolved ? '⚠ ' : ''}
+                  без исхода: {Math.round((st.expired / st.total) * 100)}% ({st.expired} из {st.total})
+                </div>
+              )}
               {/* Подпись популяции. Цифра выше описывает выборку, а не рынок, и без
                   условия отбора неинтерпретируема. Отдельной строкой — расхождение с
                   алертом: у спреда порог записи фиксирован, а порог алерта пользователь
@@ -238,7 +257,9 @@ export function PatternHistory() {
               {st.edge && st.edge.expectancyPct != null && (
                 <div className="mt-1.5 rounded border border-zinc-800/80 bg-zinc-950/40 p-1.5 text-[10px] tabular-nums">
                   <div className="flex items-baseline justify-between gap-1">
-                    <span className="text-zinc-500">эдж на сделку</span>
+                    <span className="text-zinc-500" title="Окно последних исходов — та же выборка, на которой стоит вердикт и авто-отключение">
+                      эдж на сделку (окно n={st.edge.n})
+                    </span>
                     <span className={st.edge.expectancyPct > 0 ? 'font-medium text-emerald-400' : 'font-medium text-rose-400'}>
                       {st.edge.expectancyPct > 0 ? '+' : ''}
                       {st.edge.expectancyPct.toFixed(3)}%
@@ -278,7 +299,9 @@ export function PatternHistory() {
               </div>
               {st.expectancyPct != null && (
                 <div className="mt-1.5 flex flex-wrap items-baseline gap-x-2 text-[10px] tabular-nums">
-                  <span className="text-zinc-500">на сделку:</span>
+                  <span className="text-zinc-500" title="За всю историю — НЕ та выборка, по которой вынесен вердикт выше">
+                    на сделку за всю историю:
+                  </span>
                   <span className={st.expectancyPct > 0 ? 'font-medium text-emerald-400' : 'font-medium text-rose-400'}>
                     {st.expectancyPct > 0 ? '+' : ''}
                     {st.expectancyPct.toFixed(3)}%

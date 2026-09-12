@@ -23,6 +23,7 @@ interface RobotAlertItem {
   algoScore: number;
   illiqScore: number;
   netSpreadPct: number | null;
+  netExecPct: number | null; // нетто минус слипейдж полного круга; null = стакан не измерен
   slip25kPct: number | null;
   maxPosUsd: number | null;
   entryEx?: ExchangeId;
@@ -201,7 +202,11 @@ export function AlertCenter({ settings, paused, scan }: { settings: Settings; pa
           for (const a of j.alerts) {
             const entry = a.entryEx ? EX_MAP[a.entryEx]?.name : '?';
             const exit = a.exitEx ? EX_MAP[a.exitEx]?.name : '?';
-            const body = `алго ${a.algoScore} · неликвид ${a.illiqScore} · нетто ${a.netSpreadPct != null ? a.netSpreadPct.toFixed(2) + '%' : '—'} · max $${a.maxPosUsd != null ? Math.round(a.maxPosUsd / 1000) + 'K' : '—'}${a.reasons.length ? ' · ' + a.reasons.slice(0, 2).join(', ') : ''}`;
+            /* Исполнимый спред печатается рядом с сырым: маршрут «вход → выход» в
+               заголовке читается как сделка, а сырой нетто у этого паттерна
+               регулярно отрицателен ещё до издержек круга. */
+            const exec = a.netExecPct != null ? `${a.netExecPct > 0 ? '+' : ''}${a.netExecPct.toFixed(2)}%` : 'стакан не измерен';
+            const body = `алго ${a.algoScore} · неликвид ${a.illiqScore} · нетто ${a.netSpreadPct != null ? a.netSpreadPct.toFixed(2) + '%' : '—'} · исполнимо ${exec} · max $${a.maxPosUsd != null ? Math.round(a.maxPosUsd / 1000) + 'K' : '—'}${a.reasons.length ? ' · ' + a.reasons.slice(0, 2).join(', ') : ''}`;
             toast({ title: `🤖 ${a.symbol} — робот вошёл в неликвид`, description: body, duration: 12000 });
             if (cfgRef.current.soundOn) beep();
             if (cfgRef.current.notifOn && 'Notification' in window && Notification.permission === 'granted') {
@@ -209,7 +214,7 @@ export function AlertCenter({ settings, paused, scan }: { settings: Settings; pa
             }
             void sendExternal(
               cfgRef.current,
-              `🤖 ${a.symbol}: робот вошёл в неликвид (алго ${a.algoScore}, неликвид ${a.illiqScore}, нетто ${a.netSpreadPct?.toFixed(2)}%, max $${a.maxPosUsd != null ? Math.round(a.maxPosUsd / 1000) + 'K' : '—'}, вход ${entry} → выход ${exit})`
+              `🤖 ${a.symbol}: робот вошёл в неликвид (алго ${a.algoScore}, неликвид ${a.illiqScore}, нетто ${a.netSpreadPct?.toFixed(2)}%, исполнимо ${exec}, max $${a.maxPosUsd != null ? Math.round(a.maxPosUsd / 1000) + 'K' : '—'}, вход ${entry} → выход ${exit})`
             );
           }
         } catch {

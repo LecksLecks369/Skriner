@@ -15,7 +15,7 @@ import { computeScore, detectSweep, execSpreadPct, natrPct, volumeZ, cvdProxy, b
 import { detectBreakout, detectChop, detectDistribution, BREAKOUT_ALERT, CHOP_ER_MAX } from './setups';
 import { amihudPct, algoProxyOf, analyzeBook, analyzeTape, assembleDeep, illiqProxyOf } from './liquidity';
 import { seriesStore, appendJournal, journalSummary, appendSnapshot, symbolReputation, warmupSeries, scheduleSeriesPersist } from './store';
-import { appendPattern, resolvePending, RECORD_THR } from './patterns';
+import { appendPattern, resolvePending, RECORD_THR, type PatternSignal } from './patterns';
 import { autoPaper } from './paper';
 import { getMarketPulse } from './market';
 
@@ -588,6 +588,10 @@ async function doScan(
   // 5. Построение строк
   const feeById = Object.fromEntries(EXCHANGES.map((e) => [e.id, e.takerFee])) as Record<ExchangeId, number>;
   const rows: CoinRow[] = [];
+  /* Спред-сигналы, отложенные до конца deep-блока: слипейдж стакана известен только
+     там, а исход спреда обязан считаться той же моделью издержек, что и бумажная
+     сделка. Порог и кулдаун при этом отрабатывают на своём месте — популяция та же. */
+  const deferredSpreadSignals: Array<Omit<PatternSignal, 'key'>> = [];
   const amihudBySym = new Map<string, number | null>();
   // свечи, по которым считались сетапы: нужны для пересчёта после ленты и ликвидаций
   const bestKlBySym = new Map<string, KlinesResult>();
@@ -897,10 +901,15 @@ async function doScan(
           hiExchange: bestBid.exchange,
           loExchange: bestAsk.exchange,
         });
-        // история паттернов: спред (исход — схлопывание вдвое по кросс-спреду)
+        /* История паттернов: спред. Запись ОТЛОЖЕНА до конца deep-блока — там и
+           только там известен слипейдж стакана, а без него исход считается с одними
+           комиссиями (0.179% против 1.04% слипейджа круга на живом замере), и вердикт
+           по эджу выходит положительным за счёт пропущенного члена. Порог и кулдаун
+           отрабатывают здесь, как и раньше: популяция сигналов не меняется, меняется
+           только момент записи внутри одного и того же скана. */
         const hiAgg = a.per.get(bestBid.exchange);
         const loAgg = a.per.get(bestAsk.exchange);
-        appendPattern({
+        deferredSpreadSignals.push({
           ts: now,
           symbol: a.symbol,
           pattern: 'spread',
@@ -1077,6 +1086,15 @@ async function doScan(
     4
   );
 
+  /* 5a-ante. Отложенные спред-сигналы: пишутся здесь, потому что слипейдж стакана
+     известен только после deep-блока. Монеты вне deep-топа получают slipRoundTripPct
+     = null — это честное «не измерено», и исход по ним пометится costSlipModeled:
+     false, а не посчитается так, будто слипейджа нет. */
+  for (const sig of deferredSpreadSignals) {
+    const row = rows.find((r) => r.symbol === sig.symbol);
+    appendPattern({ ...sig, slipRoundTripPct: row?.deep?.slipRoundTripPct ?? null });
+  }
+
   /* 5a-bis. Бумажные сделки — сразу после deep-блока: только здесь у монеты уже известны
      слипейдж и исполнимый спред, а без них симулятор торговал бы спредом с верха книги. */
   try {
@@ -1244,6 +1262,8 @@ async function doScan(
         pBuy: r.bestBid!.price,
         pSell: r.bestAsk!.price,
         sc: r.score,
+        // слипейдж одного пересечения книг — чтобы бэктест считал круг, а не разность
+        slip: r.deep?.slipRoundTripPct ?? undefined,
       }))
   );
 

@@ -31,7 +31,8 @@ import { seriesStore } from './store';
 import { BREAKOUT_ALERT, CHOP_ER_MAX, CHOP_PERSIST_BASE_RATE } from './setups';
 import {
   arbConvergeLevelPct,
-  arbFeesPct,
+  arbCostPct,
+  execSpreadPct,
   arbSlLevelPct,
   arbTpTargetPct,
   directionalCostPct,
@@ -69,6 +70,12 @@ export interface PatternSignal {
   hiPrice?: number;
   loPrice?: number;
   spreadPct?: number;
+  /* Слипейдж ОДНОГО пересечения обеих книг на момент сигнала, % (из deep-блока).
+     Пишется, чтобы исход считался той же моделью издержек, что и бумажная сделка:
+     без него из результата вычитались только комиссии, и вердикт по эджу выходил
+     положительным ровно за счёт пропущенного члена. Отсутствует у монет вне
+     deep-топа и у сигналов, записанных до появления поля. */
+  slipRoundTripPct?: number | null;
   /* для сетапов движения */
   setupScore?: number; // готовность пробоя / сила раздачи / ершистость
   level?: number; // уровень пробоя
@@ -93,7 +100,13 @@ export interface PatternSignal {
       модуль разности закрытий к середине — три разных выражения под одним именем,
       и winrate расходился 91% против 54.5% в зависимости от того, какая ветка
       сработала. Исходы v≤3 несравнимы с новыми и отбрасываются загрузчиком. */
-export const OUTCOME_VERSION = 4;
+/* v5: у спреда в издержки круга вошёл слипейдж (arbCostPct вместо arbFeesPct), когда
+      стакан на момент сигнала измерен. Исходы v4 считались с одними комиссиями —
+      0.179% против 1.04% слипейджа круга на живом замере, — поэтому они несравнимы с
+      новыми и отбрасываются загрузчиком. Версия поднята ТОЛЬКО у спреда: остальные
+      семь детекторов считаются ровно как раньше, и глобальный бамп выбросил бы их
+      историю вместе с вердиктами, которыми они выключены. */
+export const OUTCOME_VERSION = 5;
 
 /**
  * Минимальная версия, при которой исход сравним с новыми, ПО ТИПАМ.
@@ -110,7 +123,7 @@ export const OUTCOME_VERSION = 4;
  * выражение действительно изменилось.
  */
 const OUTCOME_MIN_V: Partial<Record<PatternKind, number>> = {
-  spread: 4, // путь разрыва: своя пара бирж вместо лучшей, со знаком
+  spread: 5, // издержки круга со слипейджем, а не только комиссии
 };
 const OUTCOME_MIN_V_DEFAULT = 3;
 
@@ -154,7 +167,19 @@ const DATA_DIR = path.join(process.cwd(), 'data');
 const PATTERNS_FILE = path.join(DATA_DIR, 'pattern_history.jsonl');
 const OUTCOMES_FILE = path.join(DATA_DIR, 'pattern_outcomes.json');
 const MAX_SIGNALS = 3000;
-const HORIZON_MS = 30 * 60 * 1000;
+/* Горизонт оценки исхода. Экспортируется, потому что он же задаёт нижнюю границу
+   любого кулдауна: сетка, которая перебирает кулдауны короче горизонта, выбирает
+   комбинации на перекрывающихся дубликатах одного события. */
+export const HORIZON_MS = 30 * 60 * 1000;
+
+/* Задержка входа: путь разрыва читается не с момента сигнала, а на столько позже.
+   Смысл — время на то, чтобы поставить обе ноги; без него симуляция засчитывала бы
+   схождение, случившееся раньше, чем позиция могла существовать. Величина была
+   вписана числом прямо в выражение и нигде не объяснена, поэтому её побочный эффект
+   (первые минуты окна невидимы, включая стоп) не был виден ни в подписи популяции,
+   ни в отчёте. Теперь она константа и печатается в подписи популяции спреда. */
+export const ARB_ENTRY_LAG_MS = 5 * 60_000;
+
 const EXPIRE_MS = 6 * 3600 * 1000;
 const RESOLVE_BATCH = 10; // максимум дооценок за вызов (лимит API-нагрузки)
 
@@ -231,7 +256,13 @@ const COOLDOWN_RAW: Record<PatternKind, number> = {
    Хуже того, дубликаты копятся именно на том, что ДЛИТСЯ, — а разрыв, который
    не закрылся, есть контрпример к тезису паттерна. Сигнал, повторно взведённый
    внутри горизонта, — это продолжение открытого, а не новое наблюдение. */
-const COOLDOWN_MS = Object.fromEntries(
+/* Экспортируется, потому что кулдаун — это граница популяции, и поток алертов
+   обязан жить по той же, что и запись. Пока у алертов были свои числа (10/15/20
+   мин против 30 у записи), карточки robot/breakout/distribution подписывались
+   alertScope: 'same' — «алерт по тому же условию», — и это было неверно: на один
+   символ алертов выходило втрое больше, чем записей, а win-rate считался по
+   записям. */
+export const COOLDOWN_MS = Object.fromEntries(
   Object.entries(COOLDOWN_RAW).map(([k, v]) => [k, Math.max(v, HORIZON_MS)]),
 ) as Record<PatternKind, number>;
 
@@ -251,7 +282,9 @@ const cooldownLabel = (k: PatternKind) => `не чаще раза в ${Math.roun
 export type AlertScope = 'same' | 'differs' | 'none';
 export const PATTERN_POPULATION: Record<PatternKind, { population: string; alertScope: AlertScope; alertNote: string }> = {
   spread: {
-    population: `нетто-спред ≥ ${RECORD_THR.spreadNetPct}% · ${cooldownLabel('spread')}`,
+    population:
+      `нетто-спред ≥ ${RECORD_THR.spreadNetPct}% · ${cooldownLabel('spread')} · ` +
+      `вход с задержкой ${Math.round(ARB_ENTRY_LAG_MS / 60_000)} мин, издержки круга со слипейджем там, где стакан измерен`,
     alertScope: 'differs',
     alertNote: 'порог алерта задаётся в настройках отдельно — win-rate посчитан по всем записанным сигналам, а не по доехавшим до алерта',
   },
@@ -559,8 +592,14 @@ function evalDirectional(
   for (const p of win) if (Math.abs(p.ts - target) < Math.abs(edge.ts - target)) edge = p;
   const move = dir === 'long' ? ((edge.c - entry) / entry) * 100 : ((entry - edge.c) / entry) * 100;
   const gross = exit === 'tp' ? tpPct : exit === 'sl' ? -slPct : move;
-  const pnl = gross - costPct;
   const r3 = (v: number) => Math.round(v * 1000) / 1000;
+  /* Округление ДО сравнения с нулём, а не после. Иначе запись перестаёт быть
+     достаточной, чтобы вердикт по ней воспроизвести: в исходе оказывается число,
+     соседнее с тем, по которому вердикт вынесен, и противоречие вида pnlPct = 0
+     рядом с win = true возникает с частотой, которую задаёт шаг округления, а не
+     степень неправоты системы. Та же дисциплина уже соблюдалась в evalChopPersist
+     и не была перенесена на соседей. */
+  const pnl = r3(gross - costPct);
   return {
     ts: Date.now(),
     mfePct: r3(mfe),
@@ -569,7 +608,7 @@ function evalDirectional(
     win: pnl > 0,
     v: OUTCOME_VERSION,
     exit,
-    pnlPct: r3(pnl),
+    pnlPct: pnl,
     pnlGrossPct: r3(gross),
     costPct: r3(costPct),
     costSlipModeled: false,
@@ -645,8 +684,17 @@ function simulateSpreadTrade(sig: PatternSignal, path: SpreadPt[]): PatternOutco
   const feePair = feePairPct(loEx, hiEx);
   const netEntry = sig.netPct ?? (sig.spreadPct != null ? sig.spreadPct - feePair : null);
   if (netEntry == null) return null;
-  const cost = arbFeesPct(loEx, hiEx);
-  const from = sig.ts + 5 * 60_000;
+  /* Издержки круга со слипейджем, когда стакан на момент сигнала был измерен.
+     Пока вычитались только комиссии, паттерн «спред» выносил вердикт 'positive'
+     (+0.155% на сделку, 79% побед) и открывал алерты, тогда как симулятор с полными
+     издержками на том же типе сделки давал -2.34% и 3.4% побед на 148 закрытых
+     позициях. Пропущенный член был не поправкой, а доминирующим: медиана слипейджа
+     одного пересечения книг 0.519% (то есть 1.04% на круг) против 0.179% комиссий и
+     0.334% валового результата — то есть знак результата был свойством пропуска, а
+     не рынка. costSlipModeled говорит, какой моделью посчитан каждый исход. */
+  const slipModeled = typeof sig.slipRoundTripPct === 'number' && Number.isFinite(sig.slipRoundTripPct);
+  const cost = arbCostPct(loEx, hiEx, slipModeled ? sig.slipRoundTripPct! : null);
+  const from = sig.ts + ARB_ENTRY_LAG_MS;
   const to = sig.ts + HORIZON_MS;
   const win = path.filter((p) => p.ts >= from && p.ts <= to && Number.isFinite(p.gross)).sort((a, b) => a.ts - b.ts);
   if (win.length < 8) return null;
@@ -679,18 +727,20 @@ function simulateSpreadTrade(sig: PatternSignal, path: SpreadPt[]): PatternOutco
     }
   }
   const r3 = (v: number) => Math.round(v * 1000) / 1000;
+  // округление ДО сравнения: записанное число обязано определять приписанный к нему вердикт
+  const pnlR = r3(pnl);
   return {
     ts: Date.now(),
     mfePct: r3(mfe), // лучший P&L за окно, п.п. (не % схлопывания, как было до v3)
     maePct: r3(mae),
     movePct: r3(netNow - netEntry), // насколько сдвинулся нетто-спред, п.п. (минус = сошёлся)
-    win: pnl > 0,
+    win: pnlR > 0,
     v: OUTCOME_VERSION,
     exit,
-    pnlPct: r3(pnl),
-    pnlGrossPct: r3(pnl + cost),
+    pnlPct: pnlR,
+    pnlGrossPct: r3(pnlR + cost),
     costPct: r3(cost),
-    costSlipModeled: false,
+    costSlipModeled: slipModeled,
   };
 }
 
@@ -888,14 +938,40 @@ export interface PatternStat {
   alertNote: string;
   avgMaeWin: number | null; // средняя просадка у выигравших, % — цена, которую пришлось пересидеть
   edge: EdgeReport; // матожидание с доверительным интервалом, вердикт и флаг выключения
-  /* Затвор алерта против своей контрольной группы: passed — то, что доезжает до
-     оператора, blocked — то, что отфильтровано. Фильтр без контрольной группы
-     недоказуем, поэтому запись идёт по обеим. null у типов без своего затвора. */
+  /* Затвор алерта против своих контрольных групп. Затвор — КОНЪЮНКЦИЯ, и разбивать
+     выборку по одному её члену значит описывать не ту популяцию, что доезжает до
+     оператора: пока здесь стоял только z, «passed» показывал 22 сигнала со 100%
+     побед, тогда как реальный затвор снимает ещё и всё, что неисполнимо по стакану.
+     Поэтому групп четыре, и каждая названа причиной отсева. Порог пользователя
+     сюда не входит и входить не может — он задаётся в настройках, поэтому
+     alertScope у спреда 'differs'. */
   byAlertGate: {
     minZ: number;
-    passed: { n: number; winRate: number | null; expectancyPct: number | null };
-    blocked: { n: number; winRate: number | null; expectancyPct: number | null };
+    gates: string[];
+    passed: AlertGateCell;
+    blockedZ: AlertGateCell; // исполним, но разрыв не аномален для самого символа
+    blockedExec: AlertGateCell; // круг дороже разрыва: netExec <= 0
+    execUnknown: AlertGateCell; // стакан на момент сигнала не измерен — вердикта нет
   } | null;
+}
+
+/** Ячейка разбивки по затвору алерта. pnlN отдельно от n: исход без pnlPct — это
+    отсутствие данных, и деление на n разбавляло бы среднее нулями. */
+export interface AlertGateCell {
+  n: number;
+  pnlN: number;
+  winRate: number | null;
+  expectancyPct: number | null;
+}
+
+/** Доли считаются по своим знаменателям, а не по общему n */
+function gateCell(a: { n: number; wins: number; pnl: number; pnlN: number }): AlertGateCell {
+  return {
+    n: a.n,
+    pnlN: a.pnlN,
+    winRate: a.n ? Math.round((a.wins / a.n) * 1000) / 1000 : null,
+    expectancyPct: a.pnlN ? Math.round((a.pnl / a.pnlN) * 1000) / 1000 : null,
+  };
 }
 
 /* ---------------- Эдж и авто-отключение ---------------- */
@@ -940,14 +1016,24 @@ const RATE_BASELINE: Partial<Record<PatternKind, number>> = {
  * Попадания по каждому типу из RATE_BASELINE, в хронологическом порядке.
  * Фильтр тот же, что у pnlSequences: истёкшие (win == null) — отсутствие данных, а не промах.
  */
-function hitSequences(): Record<PatternKind, boolean[]> {
+/* Вместе с попаданиями отдаётся символ каждого исхода — по той же причине, что и у
+   P&L: строки одного символа коррелированы, и интервал доли обязан ресэмплить
+   символы. Пока единицы сюда не передавались, затвор детекторов «попал/не попал»
+   стоял на построчном Уилсоне, то есть на более узком интервале, чем данные
+   позволяют, — при том что для матожидания это было исправлено. */
+function hitSequences(): Record<PatternKind, { hit: boolean[]; sym: string[] }> {
   const arr = loadSignals();
   const out = loadOutcomes();
-  const seq = Object.fromEntries(ALL_KINDS.map((k) => [k, [] as boolean[]])) as Record<PatternKind, boolean[]>;
+  const seq = Object.fromEntries(
+    ALL_KINDS.map((k) => [k, { hit: [] as boolean[], sym: [] as string[] }])
+  ) as Record<PatternKind, { hit: boolean[]; sym: string[] }>;
   for (const s of arr) {
     const oc = out[s.key];
     if (!oc || oc.win == null) continue;
-    seq[s.pattern]?.push(oc.win);
+    const t = seq[s.pattern];
+    if (!t) continue;
+    t.hit.push(oc.win);
+    t.sym.push(s.symbol);
   }
   return seq;
 }
@@ -970,7 +1056,7 @@ export function patternEdges(): Record<PatternKind, EdgeReport> {
   const v = Object.fromEntries(
     ALL_KINDS.map((k) => {
       const base = RATE_BASELINE[k];
-      return [k, base != null ? computeRateEdge(hits[k], base) : computeEdge(seq[k].pnl, seq[k].sym)];
+      return [k, base != null ? computeRateEdge(hits[k].hit, base, hits[k].sym) : computeEdge(seq[k].pnl, seq[k].sym)];
     })
   ) as Record<PatternKind, EdgeReport>;
   edgeCache = { ts: Date.now(), signals: nSig, outcomes: nOut, v };
@@ -1124,7 +1210,9 @@ export function patternStats(): { stats: PatternStat[]; anyWaiting: number } {
        считать. Поэтому запись идёт по всем сигналам, а обе группы показываются
        рядом: контрольная группа и есть единственное доказательство, что затвор
        работает. */
-    const gate = { passed: { n: 0, wins: 0, pnl: 0 }, blocked: { n: 0, wins: 0, pnl: 0 } };
+    type GateAcc = { n: number; wins: number; pnl: number; pnlN: number };
+    const mkAcc = (): GateAcc => ({ n: 0, wins: 0, pnl: 0, pnlN: 0 });
+    const gate = { passed: mkAcc(), blockedZ: mkAcc(), blockedExec: mkAcc(), execUnknown: mkAcc() };
     for (const s of sigs) {
       const oc = out[s.key];
       if (!oc) {
@@ -1137,10 +1225,18 @@ export function patternStats(): { stats: PatternStat[]; anyWaiting: number } {
       }
       resolved++;
       if (k === 'spread') {
-        const g = s.zScore != null && s.zScore >= SPREAD_ALERT_MIN_Z ? gate.passed : gate.blocked;
+        /* Затвор целиком: исполнимость по стакану И аномальность разрыва для самого
+           символа. Каждая причина отсева — своя группа, иначе «прошедшие» смешивают
+           отсеянное по одной причине с прошедшим по обеим. */
+        const exec = execSpreadPct(s.netPct ?? null, s.slipRoundTripPct ?? null);
+        const zOk = s.zScore != null && s.zScore >= SPREAD_ALERT_MIN_Z;
+        const g = exec == null ? gate.execUnknown : exec <= 0 ? gate.blockedExec : zOk ? gate.passed : gate.blockedZ;
         g.n++;
         if (oc.win) g.wins++;
-        g.pnl += oc.pnlPct ?? 0;
+        if (oc.pnlPct != null) {
+          g.pnl += oc.pnlPct;
+          g.pnlN++;
+        }
       }
       bySrc[oc.src ?? 'unknown']++;
       if (oc.exit) byExit[oc.exit]++;
@@ -1201,16 +1297,11 @@ export function patternStats(): { stats: PatternStat[]; anyWaiting: number } {
         k === 'spread'
           ? {
               minZ: SPREAD_ALERT_MIN_Z,
-              passed: {
-                n: gate.passed.n,
-                winRate: gate.passed.n ? Math.round((gate.passed.wins / gate.passed.n) * 1000) / 1000 : null,
-                expectancyPct: gate.passed.n ? Math.round((gate.passed.pnl / gate.passed.n) * 1000) / 1000 : null,
-              },
-              blocked: {
-                n: gate.blocked.n,
-                winRate: gate.blocked.n ? Math.round((gate.blocked.wins / gate.blocked.n) * 1000) / 1000 : null,
-                expectancyPct: gate.blocked.n ? Math.round((gate.blocked.pnl / gate.blocked.n) * 1000) / 1000 : null,
-              },
+              gates: ['исполнимый спред > 0 (стакан известен)', `z >= ${SPREAD_ALERT_MIN_Z}`],
+              passed: gateCell(gate.passed),
+              blockedZ: gateCell(gate.blockedZ),
+              blockedExec: gateCell(gate.blockedExec),
+              execUnknown: gateCell(gate.execUnknown),
             }
           : null,
     };
