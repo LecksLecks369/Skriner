@@ -29,6 +29,9 @@ interface Analytics {
   /* Матожидание с интервалом: то же, что в карточках паттернов — вердикт по положению нуля */
   edge?: {
     n: number;
+    /* Сколько исходов есть всего: когда их больше окна, крупная цифра и цифра за
+       всю историю — разные величины, и подписать их одинаково нельзя. */
+    nTotal: number;
     expectancyPct: number | null;
     ciLoPct: number | null;
     ciHiPct: number | null;
@@ -192,14 +195,35 @@ export function PaperPanel({ scan }: { scan: ScanResponse | null }) {
               {analytics.profitFactor != null ? analytics.profitFactor.toFixed(2) : '∞'}
             </div>
           </div>
+          {/* Точка и интервал обязаны описывать ОДНУ выборку. Здесь стояло среднее по
+              всем закрытым сделкам, а под ним — интервал по окну последних n: разные
+              популяции в одной плитке, читаемые как одна оценка. Расхождение было
+              арифметически видно на экране — точка -2.198% лежала ВНЕ собственного
+              интервала [-2.161; -1.369], потому что это интервал не для неё. Крупное
+              число теперь берётся из того же окна, что и интервал с вердиктом, а
+              среднее за всю историю подписано отдельной строкой. */}
           <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-2">
-            <div className="text-[10px] uppercase text-zinc-600" title="Средний P&L одной сделки — что даёт стратегия на круг">матожидание</div>
-            <div className={`font-mono text-lg tabular-nums ${(analytics.expectancy ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
-              {analytics.expectancy != null ? `${analytics.expectancy >= 0 ? '+' : ''}${analytics.expectancy.toFixed(3)}%` : '—'}
+            <div
+              className="text-[10px] uppercase text-zinc-600"
+              title="Средний P&L одной сделки на окне последних исходов — той же выборке, на которой стоит вердикт"
+            >
+              матожидание{analytics.edge?.n ? ` (окно n=${analytics.edge.n})` : ''}
+            </div>
+            <div className={`font-mono text-lg tabular-nums ${(analytics.edge?.expectancyPct ?? analytics.expectancy ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>
+              {(() => {
+                const v = analytics.edge?.expectancyPct ?? analytics.expectancy;
+                return v != null ? `${v >= 0 ? '+' : ''}${v.toFixed(3)}%` : '—';
+              })()}
             </div>
             {analytics.edge?.ciLoPct != null && analytics.edge.ciHiPct != null && (
               <div className="mt-0.5 font-mono text-[10px] tabular-nums text-zinc-600" title={analytics.edge.reason}>
-                95% [{analytics.edge.ciLoPct.toFixed(3)}; {analytics.edge.ciHiPct.toFixed(3)}] · n={analytics.edge.n}
+                95% [{analytics.edge.ciLoPct.toFixed(3)}; {analytics.edge.ciHiPct.toFixed(3)}]
+              </div>
+            )}
+            {analytics.expectancy != null && analytics.edge?.expectancyPct != null && analytics.edge.nTotal > analytics.edge.n && (
+              <div className="mt-0.5 font-mono text-[10px] tabular-nums text-zinc-700">
+                за всю историю (n={analytics.edge.nTotal}): {analytics.expectancy >= 0 ? '+' : ''}
+                {analytics.expectancy.toFixed(3)}%
               </div>
             )}
           </div>
