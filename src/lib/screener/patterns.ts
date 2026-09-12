@@ -28,7 +28,7 @@ import path from 'path';
 import type { Candle, ExchangeId } from './types';
 import { fetchKlines, KLINES_BARS } from './exchanges';
 import { seriesStore } from './store';
-import { BREAKOUT_ALERT, CHOP_ER_MAX, CHOP_PERSIST_BASE_RATE } from './setups';
+import { BREAKOUT_ALERT, CHOP_ER_MAX, CHOP_PERSIST_BASE_RATE, CHOP_PERSIST_BASE_LO, CHOP_PERSIST_BASE_HI } from './setups';
 import {
   arbConvergeLevelPct,
   arbCostPct,
@@ -38,7 +38,7 @@ import {
   directionalCostPct,
   feePairPct,
 } from './costs';
-import { EDGE_WINDOW, computeEdge, computeRateEdge, wilsonInterval, type EdgeReport } from './edge';
+import { EDGE_WINDOW, combineStrata, computeRateEdge, wilsonInterval, type EdgeReport } from './edge';
 
 export type PatternKind = 'spread' | 'robot' | 'sweep' | 'whale' | 'funding' | 'breakout' | 'distribution' | 'chop';
 
@@ -350,7 +350,7 @@ export const PATTERN_POPULATION: Record<PatternKind, { population: string; alert
     alertNote: 'алерт по тому же условию',
   },
   chop: {
-    population: `ER ≤ ${CHOP_ER_MAX} · контроль — persistence ${(CHOP_PERSIST_BASE_RATE * 100).toFixed(1)}% (доля окон с пилой ПОСЛЕ окна с пилой, не доля произвольных)`,
+    population: `ER ≤ ${CHOP_ER_MAX} · контроль — persistence ${(CHOP_PERSIST_BASE_RATE * 100).toFixed(1)}% [${(CHOP_PERSIST_BASE_LO * 100).toFixed(1)}; ${(CHOP_PERSIST_BASE_HI * 100).toFixed(1)}]% (доля окон с пилой ПОСЛЕ окна с пилой, не доля произвольных; контроль сам измерен, поэтому едет с интервалом)`,
     alertScope: 'same',
     alertNote: 'едет пометкой внутри алерта пробоя, по тому же условию',
   },
@@ -446,7 +446,7 @@ export const PATTERN_META: Record<PatternKind, { icon: string; name: string; hin
     name: 'Ёрш',
     /* Подпись собирается из тех же констант, что и решение: переписанная руками,
        она расходится с кодом молча и ровно тогда, когда порог двигают. */
-    hint: `пила сохранилась: эффективность хода за следующие 30 минут ≤ ${CHOP_ER_MAX} — контроль ${(CHOP_PERSIST_BASE_RATE * 100).toFixed(1)}% (persistence: как часто пила держится ПОСЛЕ пилы)`,
+    hint: `пила сохранилась: эффективность хода за следующие 30 минут ≤ ${CHOP_ER_MAX} — контроль ${(CHOP_PERSIST_BASE_RATE * 100).toFixed(1)}% [${(CHOP_PERSIST_BASE_LO * 100).toFixed(1)}; ${(CHOP_PERSIST_BASE_HI * 100).toFixed(1)}]% (persistence: как часто пила держится ПОСЛЕ пилы)`,
   },
 };
 
@@ -981,13 +981,33 @@ export async function resolvePending(): Promise<number> {
           const tp = sig.tpPct ?? tgt!.tp;
           const sl = sig.slPct ?? tgt!.sl;
           const cost = directionalCostPct(sig.ex); // круг тейкером на бирже сигнала
-          // 1) серии в памяти (покрывают до ~9ч при живом сервере)
           const fromAtr = sig.tpPct != null || (tgt?.fromAtr ?? false);
-          oc = from(evalDirectional(seriesPath(sig.symbol, sig.ex), sig.price, sig.dir, sig.ts, tp, sl, cost, fromAtr), 'series');
-          // 2) клайны биржи сигнала (покрывают ~85 минут назад)
-          if (!oc && sig.ex && sig.native) {
+          /* КЛАЙНЫ ПЕРВЫМИ, серия — запасной вариант. Порядок был обратный, и это
+             ровно тот дефект, который уже был исправлен ветвью ерша двадцатью
+             строками выше — с обоснованием, применимым здесь дословно и не
+             применённым.
+
+             Серия хранит одну цену на тик: у её точек high = low = close, то есть
+             внутритиковых экстремумов в ней нет вовсе. Правило выхода «тейк или стоп,
+             что задето первым» на таком пути не может увидеть ни одного касания между
+             замерами, и сделка разрешается таймаутом. Смещение односторонее и
+             двойное: не видны и тейки, и стопы, а шаг серии — шаг скана (замер по
+             series.json: ~150 с между точками, местами 490), то есть 12 точек там, где
+             у клайнов 30 из 30. Отпечаток в записях: 38% направленных исходов
+             закрылись таймаутом, у свипа 76%, и 17-18% несут mfePct или maePct ровно
+             равные нулю — чего реальные внутрибарные данные практически не дают.
+
+             Клайны покрывают только KLINES_COVER_MS назад, поэтому серия остаётся
+             нужна для более старых сигналов — но как запасной путь, а не как тот,
+             который выигрывает лишь потому, что первым вернул непустой результат.
+             Обе ветки помечаются в src, и их расхождение видно в bySrc: у ерша
+             замер по ним давал 0.909 против 0.545 на одном детекторе. */
+          if (sig.ex && sig.native) {
             const path = await klinesPath(sig.ex, sig.native);
             if (path) oc = from(evalDirectional(path, sig.price, sig.dir, sig.ts, tp, sl, cost, fromAtr), 'klines');
+          }
+          if (!oc) {
+            oc = from(evalDirectional(seriesPath(sig.symbol, sig.ex), sig.price, sig.dir, sig.ts, tp, sl, cost, fromAtr), 'series');
           }
         }
         if (!oc) {
@@ -1037,7 +1057,11 @@ export interface PatternStat {
   /* Чем посчитаны исходы. Две ветки — две методики (серии слепы к теням внутри тика),
      поэтому доля здесь читается как состав выборки, а не как справка о работе кэша.
      unknown — исходы, записанные до появления поля. */
-  bySrc: { series: number; klines: number; unknown: number };
+  /* Не только доля, но и РЕЗУЛЬТАТ по каждой ветке: доля показывает состав смеси,
+     а расхождение веток — это и есть находка. Замер на ерше давал по двум ветвям
+     0.909 против 0.545 на одном детекторе, то есть противоположные утверждения под
+     одним win-rate; пока рядом стояли только счётчики, сравнить было нечего. */
+  bySrc: Record<'series' | 'klines' | 'unknown', { n: number; winRate: number | null; expectancyPct: number | null }>;
   /* Какой целью посчитан каждый исход. atr — цель от волатильности самой монеты,
      fixed — запасная фиксированная (волатильность на момент сигнала неизвестна).
      Это ДВЕ РАЗНЫЕ ВЕЛИЧИНЫ под одним win-rate, и доля обязана быть видна: у тихой
@@ -1046,6 +1070,14 @@ export interface PatternStat {
   /* Медианная цель по выборке, % — чтобы «win-rate 45%» читался вместе с тем, на
      каком ходе он измерен. null у ненаправленных. */
   medianTargetPct: number | null;
+  /* Доля исходов, посчитанных ЗАЯВЛЕННОЙ в hint целью от NATR монеты — выводится из
+     byTarget, а не набирается рядом с подписью. Подпись утверждает «цель = 0.75 ×
+     NATR × √30» для всех направленных детекторов; на замере это было верно только у
+     пробоя (139 исходов от NATR), а у робота, свипа, китов, фандинга и раздачи ВСЕ
+     исходы посчитаны запасной фиксированной целью, потому что natrPct на их сигналах
+     отсутствовал. Утверждение в подписи и величина в записи — две разные вещи, и
+     связать их может только число, посчитанное из самих записей. */
+  targetNote: string | null;
   /* Условие, при котором сигнал попал в журнал. Win-rate относится ровно к этому
      множеству: без границы отбора он описывает неизвестно что. */
   population: string;
@@ -1100,21 +1132,68 @@ function gateCell(a: { n: number; wins: number; pnl: number; pnlN: number }): Al
    наблюдения. Строки одного символа коррелированы (повторные сработки на одном
    затянувшемся разрыве), и интервал в edge.ts обязан ресэмплить символы, а не
    строки, иначе он сужается пропорционально дублированию. */
-function pnlSequences(): Record<PatternKind, { pnl: number[]; sym: string[] }> {
+/**
+ * Слой, к которому относится исход: КАКИМ ВЫРАЖЕНИЕМ он посчитан.
+ *
+ * Два места, где под одним именем живут две величины:
+ *   • спред — издержки круга со слипейджем (стакан на момент сигнала измерен) либо
+ *     только комиссии (не измерен). Второе — ВЕРХНЯЯ ГРАНИЦА: пропущенный член на
+ *     живом замере был ~1.04% против 0.18% комиссий, то есть кратно больше самого
+ *     разрыва, из которого вычитается;
+ *   • направленные — цель от NATR монеты либо запасная фиксированная. Фиксированные
+ *     0.4% у монеты с NATR 0.04% недостижимы за окно, у монеты с NATR 2% берутся
+ *     шумом: это разные сделки, а не разная точность одной.
+ *
+ * Флаги costSlipModeled и tpFromAtr писались в исход давно и ровно для этого —
+ * «чтобы две величины не смешались в одном win-rate», — но потреблялись только
+ * счётчиками в карточке. Затвор продолжал стоять на объединении. Здесь флаг
+ * наконец становится границей выборки, а не справкой о ней.
+ */
+function outcomeStratum(kind: PatternKind, oc: PatternOutcome): { key: string; label: string } {
+  if (kind === 'spread') {
+    return oc.costSlipModeled
+      ? { key: 'cost-full', label: 'издержки со слипейджем' }
+      : { key: 'cost-fees-only', label: 'только комиссии (верхняя граница)' };
+  }
+  return oc.tpFromAtr
+    ? { key: 'target-atr', label: 'цель от NATR монеты' }
+    : { key: 'target-fixed', label: 'запасная фиксированная цель' };
+}
+
+/* Порядок слоёв — порядок предпочтения при равном n; крупнейший всё равно
+   выбирается по n, но при ничьей побеждает более полная методика. */
+const STRATUM_ORDER = ['cost-full', 'cost-fees-only', 'target-atr', 'target-fixed'];
+
+type Stratum = { key: string; label: string; pnl: number[]; sym: string[]; ts: number[] };
+
+function pnlSequences(): Record<PatternKind, Stratum[]> {
   const arr = loadSignals();
   const out = loadOutcomes();
-  const seq = Object.fromEntries(
-    ALL_KINDS.map((k) => [k, { pnl: [] as number[], sym: [] as string[] }])
-  ) as Record<PatternKind, { pnl: number[]; sym: string[] }>;
+  const seq = Object.fromEntries(ALL_KINDS.map((k) => [k, new Map<string, Stratum>()])) as Record<
+    PatternKind,
+    Map<string, Stratum>
+  >;
   for (const s of arr) {
     const oc = out[s.key];
     if (!oc || oc.win == null || oc.pnlPct == null) continue;
-    const t = seq[s.pattern];
-    if (!t) continue;
+    const byKey = seq[s.pattern];
+    if (!byKey) continue;
+    const st = outcomeStratum(s.pattern, oc);
+    let t = byKey.get(st.key);
+    if (!t) {
+      t = { key: st.key, label: st.label, pnl: [], sym: [], ts: [] };
+      byKey.set(st.key, t);
+    }
     t.pnl.push(oc.pnlPct);
     t.sym.push(s.symbol);
+    t.ts.push(s.ts);
   }
-  return seq;
+  return Object.fromEntries(
+    ALL_KINDS.map((k) => [
+      k,
+      [...seq[k].values()].sort((a, b) => STRATUM_ORDER.indexOf(a.key) - STRATUM_ORDER.indexOf(b.key)),
+    ])
+  ) as Record<PatternKind, Stratum[]>;
 }
 
 /* Паттерны, исход которых — попадание, а не P&L: матожидания у них нет, и затвор по
@@ -1123,8 +1202,11 @@ function pnlSequences(): Record<PatternKind, { pnl: number[]; sym: string[] }> {
    единственным, кого механизм автоотключения не трогает вовсе. Поэтому у них свой затвор,
    в своих единицах и против своей базовой частоты. Значение — доля произвольных окон
    популяции, в которых исход выполняется сам собой. */
-const RATE_BASELINE: Partial<Record<PatternKind, number>> = {
-  chop: CHOP_PERSIST_BASE_RATE,
+const RATE_BASELINE: Partial<Record<PatternKind, { rate: number; lo: number; hi: number }>> = {
+  /* Контроль едет вместе со своим интервалом: он измерен на n=847, и вердикт,
+     сравнивающий интервал детектора с точкой, приписывает контролю несуществующую
+     точность. */
+  chop: { rate: CHOP_PERSIST_BASE_RATE, lo: CHOP_PERSIST_BASE_LO, hi: CHOP_PERSIST_BASE_HI },
 };
 
 /**
@@ -1136,12 +1218,12 @@ const RATE_BASELINE: Partial<Record<PatternKind, number>> = {
    символы. Пока единицы сюда не передавались, затвор детекторов «попал/не попал»
    стоял на построчном Уилсоне, то есть на более узком интервале, чем данные
    позволяют, — при том что для матожидания это было исправлено. */
-function hitSequences(): Record<PatternKind, { hit: boolean[]; sym: string[] }> {
+function hitSequences(): Record<PatternKind, { hit: boolean[]; sym: string[]; ts: number[] }> {
   const arr = loadSignals();
   const out = loadOutcomes();
   const seq = Object.fromEntries(
-    ALL_KINDS.map((k) => [k, { hit: [] as boolean[], sym: [] as string[] }])
-  ) as Record<PatternKind, { hit: boolean[]; sym: string[] }>;
+    ALL_KINDS.map((k) => [k, { hit: [] as boolean[], sym: [] as string[], ts: [] as number[] }])
+  ) as Record<PatternKind, { hit: boolean[]; sym: string[]; ts: number[] }>;
   for (const s of arr) {
     const oc = out[s.key];
     if (!oc || oc.win == null) continue;
@@ -1149,6 +1231,7 @@ function hitSequences(): Record<PatternKind, { hit: boolean[]; sym: string[] }> 
     if (!t) continue;
     t.hit.push(oc.win);
     t.sym.push(s.symbol);
+    t.ts.push(s.ts);
   }
   return seq;
 }
@@ -1170,8 +1253,42 @@ interface MuteRecord {
   since: number; // когда минус был доказан
   reason: string; // на чём стоял вердикт тогда
   atVersion: number;
+  /* Слой выборки, на котором минус был доказан, и его n на тот момент.
+     Зачем: условие снятия сравнивает «сколько исходов новой методики уже есть» с
+     EDGE_WINDOW, и до появления слоёв rep.n была одна величина на паттерн. Теперь
+     rep.n — это n ЗАГОЛОВОЧНОГО слоя, а он не обязан быть тем, который вызвал
+     выключение: у спреда заголовок берётся из самого полного слоя (издержки со
+     слипейджем), а выключить может слой-верхняя-граница, который крупнее в разы.
+     Без привязки к слою условие снятия молча стало измерять не то, чем закрывали, —
+     и выключение, решённое на 60 исходах одной методики, ждало бы 60 исходов
+     ДРУГОЙ. Это ровно тот случай, когда изменение состава данных превращается в
+     изменение поведения, причём в сторону, которую никто не выбирал. */
+  stratum?: string;
+  atN?: number;
 }
+
+/* Кандидат на выключение: минус увиден, но ещё не подтверждён повторным замером.
+   Зачем подтверждение. Залипание было безусловным — первый же вердикт 'negative'
+   записывался навсегда, а снималcя только полным окном новых исходов. Границы
+   интервала при этом двигаются на каждом разрешённом исходе: замер на живых
+   данных — слой спреда с n=60 дал верхнюю границу −0.01% (минус доказан,
+   выключение записано), а через 7 секунд тот же слой читался [−0.02%; +0.332%].
+   То есть детектор выключался на неотличимом от нуля колебании бутстрэпа и
+   оставался выключенным часами. Асимметрия «закрыть легче, чем открыть» остаётся
+   правильной — алерт по убыточному сигналу стоит денег, — но она не повод
+   латчиться на одном мгновении: подтверждение стоит одного поля и не смягчает
+   правило, а лишь требует, чтобы минус был свойством данных, а не момента. */
+const MUTE_CONFIRM_MS = 90_000;
 const MUTES_FILE = path.join(DATA_DIR, 'pattern_mutes.json');
+
+/* Кандидатуры на выключение живут в памяти, но ПЕРЕЖИВАЮТ HMR: без привязки к
+   globalThis каждая горячая перезагрузка модуля обнуляла бы отсчёт подтверждения,
+   и в dev-режиме выключение не наступало бы никогда. Перезапуск процесса отсчёт
+   всё же сбрасывает — устойчивый минус тогда подтвердится через MUTE_CONFIRM_MS
+   после старта, а не мгновенно; это задержка в сторону тишины, а не алерта. */
+const pendingMutes: Map<PatternKind, number> =
+  ((globalThis as unknown as { __screenerPendingMutes?: Map<PatternKind, number> }).__screenerPendingMutes ??=
+    new Map<PatternKind, number>());
 
 function loadMutes(): Partial<Record<PatternKind, MuteRecord>> {
   try {
@@ -1199,13 +1316,41 @@ function saveMutes(m: Partial<Record<PatternKind, MuteRecord>>) {
  */
 function applySticky(kind: PatternKind, rep: EdgeReport, mutes: Partial<Record<PatternKind, MuteRecord>>): { rep: EdgeReport; changed: boolean } {
   const prev = mutes[kind];
+  /* Слой, на котором стоит минус: тот из strata, чей вердикт 'negative'. Без слоёв
+     (единственное выражение) — undefined, и снятие считается по rep.n, как раньше. */
+  const negStratum = rep.strata?.find((x) => x.verdict === 'negative');
   if (rep.verdict === 'negative') {
     if (!prev) {
-      mutes[kind] = { since: Date.now(), reason: rep.reason, atVersion: OUTCOME_VERSION };
+      const now = Date.now();
+      const seen = pendingMutes.get(kind);
+      if (seen == null) {
+        /* Первый раз: запоминаем момент и НЕ выключаем. Вердикт при этом остаётся
+           'negative' — оператор видит, что минус измерен, — но muted пока false. */
+        pendingMutes.set(kind, now);
+        return {
+          rep: { ...rep, muted: false, reason: `${rep.reason}. Минус увиден впервые, выключение — после подтверждения повторным замером` },
+          changed: false,
+        };
+      }
+      if (now - seen < MUTE_CONFIRM_MS) {
+        return {
+          rep: { ...rep, muted: false, reason: `${rep.reason}. Ожидается подтверждение минуса (${Math.round((now - seen) / 1000)}с из ${Math.round(MUTE_CONFIRM_MS / 1000)})` },
+          changed: false,
+        };
+      }
+      mutes[kind] = {
+        since: now,
+        reason: rep.reason,
+        atVersion: OUTCOME_VERSION,
+        ...(negStratum ? { stratum: negStratum.key, atN: negStratum.n } : { atN: rep.n }),
+      };
+      pendingMutes.delete(kind);
       return { rep, changed: true };
     }
     return { rep, changed: false };
   }
+  /* Минус не подтвердился — кандидатура снимается, отсчёт начнётся заново. */
+  pendingMutes.delete(kind);
   if (!prev) return { rep, changed: false };
   /* Снимается залипание только на ПОЛНОМ окне, а не на минимуме для вердикта.
      Асимметрия намеренная: чтобы доказать минус, понадобилось 60 исходов, и
@@ -1213,7 +1358,21 @@ function applySticky(kind: PatternKind, rep: EdgeReport, mutes: Partial<Record<P
      втрое меньшем основании, чем его закрыли. Из двух ошибок здесь необратима
      одна — алерт по убыточному сигналу стоит денег, а лишние полчаса тишины стоят
      упущенной возможности, которую видно в журнале и можно вернуть. */
-  if (rep.n < EDGE_WINDOW) {
+  /* Прогресс к пересмотру считается по ЗАГОЛОВОЧНОМУ слою (rep.n), а НЕ по тому,
+     который вызвал выключение. Это не симметрия ради симметрии:
+     реабилитация — утверждение положительное («детектор не теряет деньги»), а
+     положительное утверждение требует самой полной методики. У спреда слой
+     «только комиссии» есть ВЕРХНЯЯ граница: его отрицательность доказывает убыток
+     (поэтому выключить он вправе), но его неотрицательность не доказывает ничего —
+     слипейдж из него не вычтен. Снимать выключение по нему значило бы открывать
+     алерты на основании, которое по построению не может их обосновать. combineStrata
+     выбирает заголовком именно полный слой, поэтому rep.n — это n той методики,
+     которая одна и может реабилитировать.
+     Поле stratum в записи остаётся как ПРОВЕНАНС — на чём минус был доказан, —
+     и в условие снятия не входит. */
+  const gaugeName = rep.strata?.length ? ' (полная методика)' : '';
+  const progressN = rep.n;
+  if (progressN < EDGE_WINDOW) {
     const since = new Date(prev.since).toISOString().slice(0, 10);
     return {
       rep: {
@@ -1221,7 +1380,7 @@ function applySticky(kind: PatternKind, rep: EdgeReport, mutes: Partial<Record<P
         muted: true,
         reason:
           `выключен с ${since} по доказанному минусу (${prev.reason}). ` +
-          `Сейчас ${rep.n} исходов новой методики из ${EDGE_WINDOW}, нужных для пересмотра; текущая оценка — ${rep.reason}`,
+          `Сейчас ${progressN} исходов${gaugeName} из ${EDGE_WINDOW}, нужных для пересмотра; текущая оценка — ${rep.reason}`,
       },
       changed: false,
     };
@@ -1251,7 +1410,17 @@ export function patternEdges(): Record<PatternKind, EdgeReport> {
   const v = Object.fromEntries(
     ALL_KINDS.map((k) => {
       const base = RATE_BASELINE[k];
-      const raw = base != null ? computeRateEdge(hits[k].hit, base, hits[k].sym) : computeEdge(seq[k].pnl, seq[k].sym);
+      /* combineStrata, а не computeEdge по объединению: у спреда и у направленных
+         исходы приходят двумя выражениями, и вердикт, выключающий детектор, не
+         может стоять на их смеси. Один слой — combineStrata сводится к computeEdge. */
+      /* ordered у спреда: его слои упорядочены по полноте издержек — «только
+         комиссии» есть верхняя граница «со слипейджем», и заголовок обязан брать
+         полный слой, даже если он меньше. У направленных слои несравнимы: цель от
+         NATR и фиксированная цель — разные сделки, ни одна не граница другой. */
+      const raw =
+        base != null
+          ? computeRateEdge(hits[k].hit, base, hits[k].sym, hits[k].ts)
+          : combineStrata(seq[k], { ordered: k === 'spread' });
       const st = applySticky(k, raw, mutes);
       if (st.changed) dirty = true;
       return [k, st.rep];
@@ -1402,7 +1571,11 @@ export function patternStats(): { stats: PatternStat[]; anyWaiting: number } {
     let costSum = 0;
     let costN = 0;
     const byExit = { tp: 0, sl: 0, timeout: 0, converged: 0 };
-    const bySrc = { series: 0, klines: 0, unknown: 0 };
+    const srcAcc: Record<'series' | 'klines' | 'unknown', { n: number; wins: number; pnl: number; pnlN: number }> = {
+      series: { n: 0, wins: 0, pnl: 0, pnlN: 0 },
+      klines: { n: 0, wins: 0, pnl: 0, pnlN: 0 },
+      unknown: { n: 0, wins: 0, pnl: 0, pnlN: 0 },
+    };
     const byTarget = { atr: 0, fixed: 0 };
     const targets: number[] = [];
     /* Win-rate, разбитый по затвору алерта. Фильтр, поставленный перед выдачей,
@@ -1439,7 +1612,15 @@ export function patternStats(): { stats: PatternStat[]; anyWaiting: number } {
           g.pnlN++;
         }
       }
-      bySrc[oc.src ?? 'unknown']++;
+      {
+        const sa = srcAcc[oc.src ?? 'unknown'];
+        sa.n++;
+        if (oc.win) sa.wins++;
+        if (oc.pnlPct != null) {
+          sa.pnl += oc.pnlPct;
+          sa.pnlN++;
+        }
+      }
       if (oc.tpUsed != null) {
         byTarget[oc.tpFromAtr ? 'atr' : 'fixed']++;
         targets.push(oc.tpUsed);
@@ -1492,11 +1673,33 @@ export function patternStats(): { stats: PatternStat[]; anyWaiting: number } {
       avgCostPct: costN ? Math.round((costSum / costN) * 1000) / 1000 : null,
       sumPnlPct: pnlN ? Math.round(pnlSum * 1000) / 1000 : null,
       byExit,
-      bySrc,
+      bySrc: Object.fromEntries(
+        (['series', 'klines', 'unknown'] as const).map((key) => {
+          const a = srcAcc[key];
+          return [
+            key,
+            {
+              n: a.n,
+              winRate: a.n ? Math.round((a.wins / a.n) * 1000) / 1000 : null,
+              expectancyPct: a.pnlN ? Math.round((a.pnl / a.pnlN) * 1000) / 1000 : null,
+            },
+          ];
+        })
+      ) as PatternStat['bySrc'],
       byTarget,
       medianTargetPct: targets.length
         ? Math.round([...targets].sort((a, b) => a - b)[Math.floor(targets.length / 2)] * 1000) / 1000
         : null,
+      targetNote: (() => {
+        const tot = byTarget.atr + byTarget.fixed;
+        if (!tot) return null;
+        const pct = Math.round((byTarget.atr / tot) * 100);
+        if (byTarget.atr === 0) {
+          return `цель от NATR монеты в подписи заявлена, но НИ ОДИН исход по ней не посчитан: у всех ${tot} волатильность на момент сигнала была неизвестна, и взята запасная фиксированная ${WIN_THR[k]}%`;
+        }
+        if (byTarget.fixed === 0) return `все ${tot} исходов посчитаны целью от NATR монеты, как и заявлено`;
+        return `целью от NATR монеты посчитано ${pct}% исходов (${byTarget.atr} из ${tot}); остальные — запасной фиксированной ${WIN_THR[k]}%, это другая величина`;
+      })(),
       ...PATTERN_POPULATION[k],
       avgMaeWin: maeWinN ? Math.round((maeWinSum / maeWinN) * 100) / 100 : null,
       edge: edges[k],

@@ -16,7 +16,7 @@ interface Signal {
 }
 
 interface JournalResp {
-  summary: { signals24h: number; conv30m: number | null; total: number };
+  summary: { signals24h: number; conv30m: number | null; convN: number; pending: number; legacy: number; total: number };
   signals: Signal[];
 }
 
@@ -42,9 +42,17 @@ export function JournalPanel() {
           <div className="font-mono text-lg tabular-nums text-zinc-100">{data?.summary.signals24h ?? '—'}</div>
         </div>
         <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-2">
-          <div className="text-[10px] uppercase text-zinc-600">сошлось за 30м</div>
-          <div className="font-mono text-lg tabular-nums text-emerald-400">
+          <div className="text-[10px] uppercase text-zinc-600">разрыв сжался</div>
+          {/* Не emerald: это не прибыль. Зелёная цифра рядом со словом «сошлось»
+              читалась как win-rate, хотя схлопывание разрыва ничего не говорит о
+              результате сделки — круг регулярно стоит дороже разрыва. */}
+          <div className="font-mono text-lg tabular-nums text-zinc-100">
             {data?.summary.conv30m != null ? `${Math.round(data.summary.conv30m * 100)}%` : '—'}
+          </div>
+          <div className="text-[9px] tabular-nums text-zinc-600">
+            n={data?.summary.convN ?? 0}
+            {data?.summary.pending ? ` · ждёт ${data.summary.pending}` : ''}
+            {data?.summary.legacy ? ` · вне вопроса ${data.summary.legacy}` : ''}
           </div>
         </div>
         <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-2">
@@ -53,8 +61,12 @@ export function JournalPanel() {
         </div>
       </div>
       <p className="max-w-2xl text-[11px] leading-relaxed text-zinc-600">
-        «Сошлось» = разрыв сократился вдвое и более в течение 30 минут после сигнала (сценарий
-        mean-reversion). Журнал персистентный — переживает перезапуск сервера.
+        «Разрыв сжался» = ГРОСС-разрыв котировок сократился вдвое и более в окне [25; 30] минут
+        после сигнала. Это утверждение о рынке, а не о сделке: круг тейкером с проскальзыванием
+        обеих ног регулярно стоит дороже самого разрыва, поэтому схлопывание не означает прибыли —
+        результат сделки с полными издержками живёт во вкладке «История» (матожидание и его
+        интервал). «Ждёт» — данных ещё нет, разрешится временем; «вне вопроса» — строки, записанные
+        до разделения гросса и нетто, гросс в них не восстановить. Журнал персистентный.
       </p>
       <div className="overflow-x-auto rounded-lg border border-zinc-800">
         <table className="w-full min-w-[560px] text-xs">

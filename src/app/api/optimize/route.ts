@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { loadSnapshotLines } from '@/lib/screener/store';
 import { numParam } from '@/lib/screener/params';
 import { simulateArb } from '@/lib/screener/arbsim';
+import { SCORE_VERSION } from '@/lib/screener/score';
 import { HORIZON_MS } from '@/lib/screener/patterns';
 import type { ExchangeId } from '@/lib/screener/types';
 
@@ -34,6 +35,9 @@ interface ComboResult {
   threshold: number;
   minScore: number;
   cooldownMin: number;
+  /* Сколько точек снимка отброшено как посчитанные ДРУГОЙ шкалой скора. Отброшенное
+     молча неотличимо от отсутствующего, поэтому число едет в результате. */
+  scaleSkipped: number;
   signals: number;
   decided: number;
   wins: number; // TP
@@ -68,6 +72,7 @@ function runCombo(
   hours: number
 ): ComboResult {
   const lastFire = new Map<string, number>();
+  let scaleSkipped = 0;
   interface Open {
     ts: number;
     symbol: string;
@@ -112,6 +117,16 @@ function runCombo(
 
     // 2) входы по фильтрам
     for (const p of line.pts) {
+      /* Шкала скора сменилась (доля доступного веса вместо суммы слагаемых), и в кольце
+         снимков лежат точки двух шкал. Порог по скору, приложенный к обеим сразу,
+         отбирает разные множества под одним именем — и результат выглядит штатно.
+         Поэтому при minScore > 0 точки чужой шкалы не берутся вовсе, а их число
+         возвращается отдельным полем: отброшенное молча неотличимо от отсутствующего.
+         При minScore = 0 скор не участвует в отборе, и старые точки остаются годны. */
+      if (minScore > 0 && (p.sv ?? 1) !== SCORE_VERSION) {
+        scaleSkipped++;
+        continue;
+      }
       if (p.net < threshold || p.sc < minScore) continue;
       const last = lastFire.get(p.s) || 0;
       if (line.ts - last < cooldownMin * 60_000) continue;
@@ -137,6 +152,7 @@ function runCombo(
     threshold,
     minScore,
     cooldownMin,
+    scaleSkipped,
     signals,
     decided,
     wins,
@@ -206,7 +222,18 @@ export async function GET(req: NextRequest) {
   const nearCd = COOLDOWNS.includes(curCooldown) ? curCooldown : COOLDOWNS[0];
   const current = results.find((r) => r.threshold === nearTh && r.minScore === nearSc && r.cooldownMin === nearCd) ?? null;
 
+  /* Агрегат по сетке: сколько точек старой шкалы скора отброшено. Комбинации с
+     minScore > 0 после смены шкалы остаются без данных, и их decided = 0 неотличим от
+     «порог ничего не нашёл» — без этой строки рекомендация «minScore = 0» выглядела бы
+     выводом из данных, а не следствием того, что у остальных выборка пуста. */
+  const scaleSkippedTotal = results.reduce((a, r) => a + r.scaleSkipped, 0);
+
   const resp = {
+    scaleSkipped: scaleSkippedTotal,
+    scaleNote:
+      scaleSkippedTotal > 0
+        ? `шкала скора сменилась: у комбинаций с minScore > 0 сравнимых точек почти нет (отброшено ${scaleSkippedTotal}), поэтому верх сетки сейчас занят minScore = 0 ПО ОТСУТСТВИЮ АЛЬТЕРНАТИВЫ, а не по измеренному преимуществу. Кольцо снимков перезаполнится за ~36 ч`
+        : null,
     hours,
     samples,
     from,

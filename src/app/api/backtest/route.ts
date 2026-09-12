@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { loadSnapshotLines } from '@/lib/screener/store';
 import { numParam } from '@/lib/screener/params';
 import { simulateArb, type ArbExit } from '@/lib/screener/arbsim';
+import { SCORE_VERSION } from '@/lib/screener/score';
 import { HORIZON_MS } from '@/lib/screener/patterns';
 import type { ExchangeId } from '@/lib/screener/types';
 
@@ -42,6 +43,7 @@ export async function GET(req: NextRequest) {
   const sp = req.nextUrl.searchParams;
   const threshold = numParam(sp, 'threshold', 0.25, 0.05);
   const minScore = numParam(sp, 'minScore', 0, 0);
+  let scaleSkipped = 0;
   const hours = numParam(sp, 'hours', 24, 1, 48);
   /* Кулдаун не может быть короче горизонта оценки: иначе один затянувшийся разрыв
      пишется как несколько сделок с перекрывающимися окнами, и n растёт, а число
@@ -91,6 +93,16 @@ export async function GET(req: NextRequest) {
 
     // 2) генерируем сигналы по фильтрам
     for (const p of line.pts) {
+      /* Шкала скора сменилась (доля доступного веса вместо суммы слагаемых), и в кольце
+         снимков лежат точки двух шкал. Порог по скору, приложенный к обеим сразу,
+         отбирает разные множества под одним именем — и результат выглядит штатно.
+         Поэтому при minScore > 0 точки чужой шкалы не берутся вовсе, а их число
+         возвращается отдельным полем: отброшенное молча неотличимо от отсутствующего.
+         При minScore = 0 скор не участвует в отборе, и старые точки остаются годны. */
+      if (minScore > 0 && (p.sv ?? 1) !== SCORE_VERSION) {
+        scaleSkipped++;
+        continue;
+      }
       if (p.net < threshold || p.sc < minScore) continue;
       const last = lastFire.get(p.s) || 0;
       if (line.ts - last < cooldownMin * 60_000) continue;
@@ -130,6 +142,15 @@ export async function GET(req: NextRequest) {
     hours,
     threshold,
     minScore,
+    scaleSkipped,
+    /* Сколько точек отброшено как посчитанные ДРУГОЙ шкалой скора, и что это значит.
+       Без этой строки пустой результат читается как «сделок не было», тогда как он
+       значит «сравнимых данных нет» — два противоположных состояния, и только одно из них
+       разрешается временем (кольцо снимков перезаполнится за ~36 ч). */
+    scaleNote:
+      scaleSkipped > 0
+        ? `отброшено ${scaleSkipped} точек со старой шкалой скора: порог minScore к ним неприменим. Пустой результат здесь значит «сравнимых данных нет», а не «сделок не было»; кольцо снимков перезаполнится за ~36 ч`
+        : null,
     cooldownMin,
     horizonMin,
     samples: lines.length,

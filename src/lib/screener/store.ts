@@ -35,7 +35,15 @@ export interface Series {
 export interface JournalEntry {
   ts: number;
   symbol: string;
+  /* Разрыв котировок ДО вычета комиссий, % — та же величина, что пишется в серию
+     crossSpread, поэтому путь разрыва и вход сравнимы между собой. Раньше сюда
+     писался НЕТТО-спред: поле называлось spreadPct, содержало нетто, было побайтово
+     равно netPct на всех строках, и при этом сравнивалось с путём ГРОСС-разрыва в
+     тесте на схлопывание — два разных выражения под одним именем. Строки, у которых
+     spreadPct === netPct, записаны по старому правилу: гросс в них не восстановить
+     (комиссии пары не сохранены), и тест на схлопывание для них не проводится. */
   spreadPct: number;
+  /** Разрыв за вычетом комиссий ОДНОГО пересечения пары книг, % */
   netPct: number | null;
   zScore: number | null;
   score: number;
@@ -43,7 +51,10 @@ export interface JournalEntry {
   hiExchange: ExchangeId;
   loExchange: ExchangeId;
   outcomeTs?: number;
-  outcomeConv?: boolean; // спред сошёлся за 30м
+  /* Гросс-разрыв сжался вдвое ВНУТРИ горизонта. Это факт о рынке, а не результат
+     сделки: круг регулярно стоит дороже разрыва, поэтому схлопывание ничего не
+     говорит о прибыли. Прибыль живёт в истории паттернов (pnlPct со слипейджем). */
+  outcomeConv?: boolean;
 }
 
 const MAX_PTS = 720; // 720 * 45с ≈ 9 часов истории
@@ -247,27 +258,76 @@ function loadJournal(): JournalEntry[] {
   return store.journal;
 }
 
-/** Сводка журнала + доращивание исходов (спред сошёлся за 30 мин?) */
-export function journalSummary(): { signals24h: number; conv30m: number | null; total: number } {
+/**
+ * Сводка журнала + доращивание исходов «гросс-разрыв сжался вдвое внутри горизонта».
+ *
+ * horizonMs передаётся вызывающим, а не объявляется здесь: это ТОТ ЖЕ horizon, по
+ * которому оценивается история паттернов (HORIZON_MS в patterns.ts). Вторая копия
+ * константы рядом с подписью «за 30 минут» рассинхронизировалась бы при первом же
+ * изменении горизонта, и подпись осталась бы правдоподобной.
+ *
+ * Три исправленных дефекта, все — расхождение подписи и выражения:
+ *
+ * 1. Окно было НЕ ОГРАНИЧЕНО сверху: `after` брал все точки позже ts+25м, и минимум
+ *    считался по всей оставшейся истории. «Сошёлся за 30 минут» означало «когда-нибудь
+ *    после 25-й минуты», а у шумного ряда минимум почти всегда рано или поздно
+ *    проваливается ниже половины — отсюда 82% схлопывания против 65% выигрышных
+ *    сделок на том же детекторе. Теперь окно закрыто горизонтом.
+ * 2. Сравнивались разные величины: путь брался из crossSpread (ГРОСС), а порог — из
+ *    e.spreadPct, куда писался НЕТТО. Теперь обе стороны гросс.
+ * 3. Старые строки (spreadPct === netPct, то есть нетто в поле гросса) не
+ *    оцениваются вовсе, а не оцениваются по подставленному значению: подстановка
+ *    производит запись, которую тест всё равно не описывает. Их число возвращается
+ *    отдельно — «сколько строк вопрос не охватывает» и «сколько ещё ждут» это
+ *    противоположные состояния, и только одно из них разрешается временем.
+ */
+export function journalSummary(horizonMs: number): {
+  signals24h: number;
+  conv30m: number | null;
+  convN: number;
+  pending: number;
+  legacy: number;
+  total: number;
+} {
   const all = loadJournal();
   const now = Date.now();
   const dayAgo = now - 24 * 3600 * 1000;
-  // доращиваем исходы по истории спредов
   let withOutcome = 0;
   let conv = 0;
+  let pending = 0;
+  let legacy = 0;
   for (const e of all) {
     if (e.outcomeConv !== undefined) {
       withOutcome++;
       if (e.outcomeConv) conv++;
       continue;
     }
-    if (now - e.ts < 30 * 60 * 1000) continue;
+    /* Гросс строго больше нетто на комиссии пары; равенство — признак строки,
+       записанной до разделения полей. Гросс в ней не восстановить. */
+    if (e.netPct != null && e.spreadPct === e.netPct) {
+      legacy++;
+      continue;
+    }
+    if (now - e.ts < horizonMs) {
+      pending++;
+      continue;
+    }
     const hist = store.series.crossSpread[e.symbol];
-    if (!hist) continue;
-    const after = hist.filter((p) => p.ts > e.ts + 25 * 60 * 1000);
-    if (!after.length) continue;
-    const minAfter = Math.min(...after.map((p) => p.v));
-    e.outcomeTs = after[0].ts;
+    if (!hist) {
+      pending++;
+      continue;
+    }
+    /* Окно закрыто с ДВУХ сторон: [ts + 25м; ts + horizon]. Верхняя граница и есть
+       та «30 минута», которая стоит в подписи. */
+    const from = e.ts + 25 * 60 * 1000;
+    const to = e.ts + horizonMs;
+    const win = hist.filter((p) => p.ts > from && p.ts <= to);
+    if (!win.length) {
+      pending++;
+      continue;
+    }
+    const minAfter = Math.min(...win.map((p) => p.v));
+    e.outcomeTs = win[0].ts;
     e.outcomeConv = minAfter <= e.spreadPct * 0.5;
     withOutcome++;
     if (e.outcomeConv) conv++;
@@ -276,6 +336,9 @@ export function journalSummary(): { signals24h: number; conv30m: number | null; 
   return {
     signals24h: recent.length,
     conv30m: withOutcome > 0 ? conv / withOutcome : null,
+    convN: withOutcome,
+    pending,
+    legacy,
     total: all.length,
   };
 }
@@ -335,6 +398,11 @@ export interface SnapPt {
      бесплатным, и сетка порогов всегда выбирала самый мягкий порог.
      Отсутствует у строк без стакана и у всех снимков до появления поля. */
   slip?: number;
+  /* Версия шкалы скора, которой посчитан sc. Скор стал долей ДОСТУПНОГО веса
+     вместо суммы слагаемых, то есть числа до и после несравнимы. Порог по скору,
+     приложенный к точкам двух шкал сразу, даёт тихо неверную выборку, поэтому
+     версия едет в самой точке. Отсутствует = старая шкала (сумма). */
+  sv?: number;
 }
 
 export interface SnapLine {

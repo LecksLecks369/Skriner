@@ -1,12 +1,13 @@
 import { NextResponse } from 'next/server';
 import { journalSummary, recentSignals } from '@/lib/screener/store';
+import { HORIZON_MS } from '@/lib/screener/patterns';
 
 export const dynamic = 'force-dynamic';
 
 export async function GET() {
   try {
     return NextResponse.json({
-      summary: journalSummary(),
+      summary: journalSummary(HORIZON_MS),
       signals: recentSignals(60),
     });
   } catch (e) {

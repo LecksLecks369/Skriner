@@ -11,11 +11,11 @@ import {
 } from './types';
 import { fetchKlines, fetchTickers, pMap, fetchBingxPremium, fetchBingxOI, fetchBinanceOI, fetchBingxTaker, fetchOkxFunding, fetchOkxOI, fetchBitgetOI, fetchSpotPrices, fetchWhaleTrades, fetchOrderbook, fetchTape, fetchOkxLiquidations, fetchLsr, fetchFundingIntervals, normalizeFunding, type Book, type SpotMap, type TapeTrade, type WhaleInfo, type LiqInfo, type LsrInfo, type FundingIntervals } from './exchanges';
 import { assetClassMap, classifySymbol, type AssetClass, type AssetClassFilter } from './assetClass';
-import { computeScore, detectSweep, execSpreadPct, natrPct, volumeZ, cvdProxy, btcCorr } from './score';
+import { computeScore, detectSweep, execSpreadPct, natrPct, volumeZ, cvdProxy, btcCorr, SCORE_VERSION } from './score';
 import { detectBreakout, detectChop, detectDistribution, BREAKOUT_ALERT, CHOP_ER_MAX } from './setups';
 import { amihudPct, algoProxyOf, analyzeBook, analyzeTape, assembleDeep, illiqProxyOf } from './liquidity';
 import { seriesStore, appendJournal, journalSummary, appendSnapshot, symbolReputation, warmupSeries, scheduleSeriesPersist } from './store';
-import { appendPattern, resolvePending, RECORD_THR, type PatternSignal } from './patterns';
+import { appendPattern, resolvePending, RECORD_THR, HORIZON_MS, type PatternSignal } from './patterns';
 import { autoPaper } from './paper';
 import { getMarketPulse } from './market';
 
@@ -32,7 +32,16 @@ const OI_HISTORY_TTL = 300_000;
    обязана читать ровно её. */
 const JOURNAL_THRESHOLD = RECORD_THR.spreadNetPct;
 export { BREAKOUT_ALERT };
-const JOURNAL_COOLDOWN = 10 * 60 * 1000;
+/* Кулдаун НЕ короче горизонта оценки. При 10 минутах против горизонта 30 один
+   затянувшийся разрыв записывался до трёх раз, окна оценки перекрывались, и
+   бутстрэп считал копии одного события независимыми наблюдениями: n растёт,
+   доказательств не прибавляется, а интервал сужается ровно в меру дублирования —
+   там же, где вердикт открывает алерты. Сетка оптимизатора это правило уже
+   соблюдала (COOLDOWNS начинается с HORIZON_MIN); живой производитель сигналов —
+   нет. Персистентность разрыва вдобавок и есть контрпример к тезису детектора
+   («разрыв схлопывается»), то есть дублировались как раз те случаи, которые тезис
+   опровергают. */
+const JOURNAL_COOLDOWN = HORIZON_MS;
 
 interface CacheGlobal {
   __screenerScan: {
@@ -666,6 +675,9 @@ async function doScan(
     let dOi15: number | null = null;
     let dOi1h: number | null = null;
     let sweepBest: ReturnType<typeof detectSweep> = null;
+    /* Запускался ли detectSweep хоть раз: без этого флага «свипа нет» и «свечей нет»
+       неразличимы в скоре, а это измеренный ноль против непрочитанного блока. */
+    let sweepScanned = false;
     let natrMax: number | null = null;
     let volZMax: number | null = null;
 
@@ -673,7 +685,9 @@ async function doScan(
       const kl = klinesBy.get(a.symbol)?.get(exId);
       const np = kl ? natrPct(kl.candles) : null;
       const vz = kl ? volumeZ(kl.candles) : null;
-      const sw = kl && kl.intervalMin <= 3 ? detectSweep(kl.candles, kl.intervalMin) : null;
+      const sweepRan = !!kl && kl.intervalMin <= 3;
+      if (sweepRan) sweepScanned = true;
+      const sw = sweepRan ? detectSweep(kl!.candles, kl!.intervalMin) : null;
       const ext = extras.get(a.symbol)?.get(exId);
       let d15: number | null = null;
       let d1h: number | null = null;
@@ -772,6 +786,7 @@ async function doScan(
       zScore,
       coverage: a.per.size,
       fundingAbs,
+      candlesOk: sweepScanned,
     });
 
     // спарклайны + прокси-CVD + корреляция с BTC
@@ -850,6 +865,8 @@ async function doScan(
       spreadAgeMin: age != null ? Math.round(age) : null,
       score: sc.score,
       scoreParts: sc.parts,
+      scoreCoverage: sc.coverage,
+      scoreMissing: sc.missing,
       fundingAbs,
       oiUsdMax,
       dOiPct15m: dOi15,
@@ -893,7 +910,11 @@ async function doScan(
         appendJournal({
           ts: now,
           symbol: a.symbol,
-          spreadPct: Number(netSpreadPct.toFixed(3)),
+          /* ГРОСС-разрыв котировок — та же величина, что уходит в серию crossSpread,
+             по которой потом считается схлопывание. Раньше здесь стоял netSpreadPct:
+             поле spreadPct содержало нетто, было равно netPct на всех строках, а
+             тест на схлопывание сравнивал его с гросс-путём. */
+          spreadPct: crossSpreadPct != null ? Number(crossSpreadPct.toFixed(3)) : Number(netSpreadPct.toFixed(3)),
           netPct: Number(netSpreadPct.toFixed(3)),
           zScore: zScore != null ? Number(zScore.toFixed(2)) : null,
           score: sc.score,
@@ -990,14 +1011,48 @@ async function doScan(
      ленты — то есть ровно тех величин, ради которых неликвид и смотрят. Поэтому часть
      мест резервируется под верх по illiqProxy. */
   const aggBySym = new Map(ranked.map((x) => [x.a.symbol, x.a]));
-  const deepTargets = [...rows].sort((x, y) => y.score - x.score).slice(0, DEEP_TARGETS - DEEP_ILLIQ_QUOTA);
-  const deepChosen = new Set(deepTargets.map((r) => r.symbol));
-  for (const r of [...rows].sort((x, y) => (y.illiqProxy ?? 0) - (x.illiqProxy ?? 0))) {
-    if (deepTargets.length >= DEEP_TARGETS) break;
-    if (deepChosen.has(r.symbol)) continue;
+
+  /* ПЕРВЫМИ в deep-блок идут монеты, по которым ПРЯМО СЕЙЧАС пишется спред-сигнал.
+     Популяция, производящая сигнал, и популяция, которой измеряют стакан, отбирались
+     по РАЗНЫМ правилам: сигнал пишется при нетто-спреде ≥ JOURNAL_THRESHOLD, а книга
+     запрашивалась у топ-40 по скору и неликвидности. Пересечение оказалось малым, и
+     последствия сложились в одну цепочку:
+
+       — слипейдж у сигнала неизвестен → execSpreadPct = null;
+       — затвор алерта требует «исполнимый спред > 0», то есть известный стакан, и
+         поэтому НИ ОДИН спред-сигнал за всю историю его не прошёл (byAlertGate.passed
+         = 0 при 84 разрешённых исходах). Затвор, который не может открыться, это не
+         строгий затвор, а выключенный детектор;
+       — исход считался с одними комиссиями: 71 исход из 84 без слипейджа. Замер по
+         двум слоям: со слипейджем −1.183% на сделку при 0 побед из 13, без него
+         +0.141% при 55 победах из 71. Отсутствие стакана решало не точность оценки,
+         а её ЗНАК.
+
+     Направление деградации здесь то же, что у бюджета стадий: дороже всех стоит
+     ровно тот член, который может отменить вердикт, — поэтому он и оказывается тем,
+     кого отбор не достаёт. Сигнальные монеты берут места впереди скора: у них
+     слипейдж не «дополнительная деталь», а единственное, что отличает сделку от
+     разрыва на экране. */
+  const signalSyms = new Set(deferredSpreadSignals.map((s) => s.symbol));
+  const deepTargets: CoinRow[] = [];
+  const deepChosen = new Set<string>();
+  const take = (r: CoinRow) => {
+    if (deepChosen.has(r.symbol) || deepTargets.length >= DEEP_TARGETS) return;
     deepChosen.add(r.symbol);
     deepTargets.push(r);
+  };
+  /* Сигнальные — по убыванию нетто-спреда: если их больше, чем мест, стакан нужнее
+     тому, у кого разрыв крупнее (у него и цена ошибки выше). */
+  for (const r of [...rows].filter((r) => signalSyms.has(r.symbol)).sort((x, y) => (y.netSpreadPct ?? 0) - (x.netSpreadPct ?? 0))) take(r);
+  /* Затем верх по скору, но не занимая квоту неликвида. */
+  for (const r of [...rows].sort((x, y) => y.score - x.score)) {
+    if (deepTargets.length >= DEEP_TARGETS - DEEP_ILLIQ_QUOTA) break;
+    take(r);
   }
+  /* Квота неликвида: скор неликвидность не учитывает, а без книги у монеты нет ни
+     слипейджа, ни maxPos, ни ленты — то есть ровно тех величин, ради которых
+     неликвид и смотрят. */
+  for (const r of [...rows].sort((x, y) => (y.illiqProxy ?? 0) - (x.illiqProxy ?? 0))) take(r);
   await pMap(
     deepTargets,
     async (r) => {
@@ -1064,9 +1119,12 @@ async function doScan(
           fundingAbs: r.fundingAbs,
           slipRoundTripPct: r.deep.slipRoundTripPct,
           maxPosUsd: r.deep.maxPosUsd,
+          candlesOk: r.scoreMissing.indexOf('sweep') < 0,
         });
         r.score = sc2.score;
         r.scoreParts = sc2.parts;
+        r.scoreCoverage = sc2.coverage;
+        r.scoreMissing = sc2.missing;
       }
       // история паттернов: «робот вошёл в неликвид» (исход — ход в сторону агрессии)
       if (r.deep.pattern?.robotIlliquid) {
@@ -1280,6 +1338,7 @@ async function doScan(
         pBuy: r.bestBid!.price,
         pSell: r.bestAsk!.price,
         sc: r.score,
+        sv: SCORE_VERSION,
         // слипейдж одного пересечения книг — чтобы бэктест считал круг, а не разность
         slip: r.deep?.slipRoundTripPct ?? undefined,
       }))
@@ -1326,7 +1385,7 @@ async function doScan(
     errors,
     refExchange: refExchangePref === 'auto' ? 'auto' : refExchangePref,
     alertThresholdPct: 0.3,
-    journal: journalSummary(),
+    journal: journalSummary(HORIZON_MS),
     market,
   };
 }

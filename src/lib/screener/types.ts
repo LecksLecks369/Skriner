@@ -159,6 +159,11 @@ export interface CoinRow {
   spreadAgeMin: number | null; // сколько минут спред ≥ порога
   score: number; // 0..100
   scoreParts: Record<string, number>;
+  /* Доля веса скора, входы которой удалось прочитать (0..1), и список непрочитанных
+     блоков. Скор нормирован по доступному весу, поэтому покрытие обязано ехать рядом с
+     ним: одинаковые 60 при полном и при половинном покрытии — разные по силе утверждения. */
+  scoreCoverage: number;
+  scoreMissing: string[];
   fundingAbs: number | null; // максимум |ставки|, приведённой к 8 часам
   fundingNormalized: boolean; // известен ли период начисления; false = ставка взята как есть
   oiUsdMax: number | null;
@@ -294,7 +299,12 @@ export interface ExchangeStatus {
 
 export interface JournalSummary {
   signals24h: number;
-  conv30m: number | null; // доля спредов, сошедшихся за 30 мин
+  /* Доля ГРОСС-разрывов, сжавшихся вдвое ВНУТРИ горизонта. Факт о рынке, не результат
+     сделки: круг регулярно стоит дороже разрыва. Прибыль — в истории паттернов. */
+  conv30m: number | null;
+  convN: number; // на скольких строках посчитано
+  pending: number; // ещё нет данных — разрешится временем
+  legacy: number; // вопрос не охватывает: гросс в строке не восстановить
   total: number;
 }
 
